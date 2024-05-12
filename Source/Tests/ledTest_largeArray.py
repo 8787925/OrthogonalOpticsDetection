@@ -6,8 +6,6 @@ import time
 from rpi_ws281x import *
 import argparse
 
-zero_DegreeLedList = []
-
 # LED strip configuration:
 LED_COUNT_LIST     = [60, 48, 40, 32, 24, 16, 12]     # Number of LEDs in each successive ring
 LED_PIN        = 18      # GPIO pin connected to the pixels (18 uses PWM!).
