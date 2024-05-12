@@ -9,62 +9,67 @@ import time
 from picamera2 import Picamera2
 import numpy as np 
 from PIL import Image
-from rpi_ws281x import *
 import argparse
 from matplotlib import pyplot as plt
-from PiRAW2TIF_16bit import *
+from Libraries import PiRAW2TIF_16bit
+from LargeLEDArray import *
+from alignImages import align_images, align_fromHomography
+import pickle
+import os
 
-zero_DegreeLedList = [6, 7, 8, 9, 10, 11, 12, 13]
+NUMBER_OF_CAMERAS = 2
+NUMBER_OF_FRAME_PAIRS = 4
+CAMERAS_ARE_MIRRORED = [False, True] #Camera 1 is mirrored to match camera 0
+picam_List = []
 
-# LED strip configuration:
-LED_COUNT      = 16     # Number of LED pixels.
-LED_PIN        = 18      # GPIO pin connected to the pixels (18 uses PWM!).
-#LED_PIN        = 10      # GPIO pin connected to the pixels (10 uses SPI /dev/spidev0.0).
-LED_FREQ_HZ    = 800000  # LED signal frequency in hertz (usually 800khz)
-LED_DMA        = 10      # DMA channel to use for generating a signal (try 10)
-LED_BRIGHTNESS = 255      # Set to 0 for darkest and 255 for brightest
-LED_INVERT     = False   # True to invert the signal (when using NPN transistor level shift)
-LED_CHANNEL    = 0       # set to '1' for GPIOs 13, 19, 41, 45 or 53
+#Initialize the cameras
+for i in range(NUMBER_OF_CAMERAS):
+    picam_List.append(Picamera2(camera_num=i))
+    capture_config = picam_List[i].create_still_configuration(raw={})
+    picam_List[i].configure(capture_config)
+    picam_List[i].start()
 
-picam2 = Picamera2()
-capture_config = picam2.create_still_configuration()
-picam2.configure(capture_config)
-picam2.start()
+LEDArray = LargeLEDArray()
 
-picam2.set_controls({"ExposureTime": 1000000}) 
-picam2.set_controls({"AnalogueGain": 1}) 
+HOMOGRAPHY_CALIBRATION_NAME = 'wallCalibration_image.pickle'
+HomographyMatrix = []
+CALIBRATION_NEEDED = True
+
+if os.path.exists(HOMOGRAPHY_CALIBRATION_NAME): 
+    with open(HOMOGRAPHY_CALIBRATION_NAME, 'rb') as f:
+        HomographyMatrix = pickle.load(f)
+    CALIBRATION_NEEDED = False
+
+#Gather the transformation array from the calibration file
+
+#picam2.set_controls({"ExposureTime": 1000000}) 
+#picam2.set_controls({"AnalogueGain": 1}) 
 
 time.sleep(2)
-ledFlashColor = Color(0, 255, 0)
+ledFlashColor = [0, 50, 0]
 
-# Define flash ring
-def ledRingCommand(strip, color, ledHalf):
-    for i in range(strip.numPixels()):
-        if (i in zero_DegreeLedList):
-            if (ledHalf):
-                strip.setPixelColor(i, Color(0, 0, 0))
-            else:
-                strip.setPixelColor(i, color)
-        else: 
-            if (ledHalf):
-                strip.setPixelColor(i, color)
-            else:
-                strip.setPixelColor(i, Color(0, 0, 0))
-    strip.show()
-
-def captureAndToggle(strip, waitTime):
+def captureAndToggle(waitTime):
     greenAndTiff = []
     g0 = []
     g1 = []
 
-    ledRingCommand(strip, ledFlashColor, 0)
+    LEDArray.setAllLEDs(ledFlashColor)
     time.sleep(waitTime)
-    rawImage1 = picam2.capture_array("raw")
-    ledRingCommand(strip, ledFlashColor, 1)
-    rawImage2 = picam2.capture_array("raw")
 
-    greenAndTiff_off = imageGreenExtraction(rawImage1, 'rawImage_Off', True)
-    greenAndTiff_on = imageGreenExtraction(rawImage2, 'rawImage_On', True)
+    rawImage = []
+    for i in range(NUMBER_OF_CAMERAS):
+        rawImage.append(picam_List[i].capture_array("raw"))
+
+    #We captured the images - convert them into np16 sized arrays in BGR format (cv2 format)
+    greenImageArray = []
+    for i in range(NUMBER_OF_CAMERAS): 
+        greenImageArray.append(PiRAW2TIF_16bit.imageGreenExtraction(rawImage[i], 'detectionScript_Camera_' + str(i), True, CAMERAS_ARE_MIRRORED[i]))
+
+    #we now have two corrected images, we need to correct index 1 to match 2
+    alignedCameraImage = align_fromHomography(greenImageArray[1][2], HomographyMatrix);
+    
+    #greenAndTiff_off = imageGreenExtraction(rawImage1, 'rawImage_Off', True)
+    #greenAndTiff_on = imageGreenExtraction(rawImage2, 'rawImage_On', True)
     
     #Capture LED Off
     g0.append(greenAndTiff_off[0])
@@ -76,9 +81,6 @@ def captureAndToggle(strip, waitTime):
 
     deltaGreen0 = np.uint16(np.abs(np.int32(g0[1]) - np.int32(g0[0])))
     deltaGreen1 = np.uint16(np.abs(np.int32(g1[1]) - np.int32(g1[0])))
-
-    ledRingCommand(strip, Color(0, 0, 0), 1)
-    ledRingCommand(strip, Color(0, 0, 0), 0)
 
     #plot and save image plot
     fig = plt.imshow(deltaGreen0, cmap='hot', interpolation='none')
@@ -101,18 +103,36 @@ if __name__ == '__main__':
     if not args.clear:
         print('Use "-c" argument to clear LEDs on exit')
 
-    strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
-    strip.begin()
-
     try:
+        if CALIBRATION_NEEDED:
+            rawCalibrationImage = [] 
+            raw16BitImages = []
+            print('No calibration file found, generating optics calibrations')
+            HomographyMatrix = []
+            for z in range(NUMBER_OF_FRAME_PAIRS): 
+                for i in range(NUMBER_OF_CAMERAS): 
+                    rawCalibrationImage.append(picam_List[i].capture_array("raw"))
+                    raw16BitImages.append(PiRAW2TIF_16bit.imageGreenExtraction(rawCalibrationImage[i], 'calibrationRawImage_Camera_' + str(i), True, CAMERAS_ARE_MIRRORED[i]))
+                print('frame capture ' + str(z) + ' completed out of ' + str(NUMBER_OF_FRAME_PAIRS))
+                #We've collected the images, now we need to generate the homography matrix
+                HomographyMatrix.append(align_images(raw16BitImages[0][2], raw16BitImages[1][2]))
+                print('frame comparison ' + str(z) + ' completed out of ' + str(NUMBER_OF_FRAME_PAIRS))
+                
+            print('Captures complete, generating optics calibration matrix')
+            HomographyMatrix_Output = np.mean(HomographyMatrix, axis=0)
+
+            with open(HOMOGRAPHY_CALIBRATION_NAME, 'wb') as f:
+                pickle.dump(HomographyMatrix_Output, f)
+
+            HomographyMatrix = HomographyMatrix_Output
+
         while True:
-            captureAndToggle(strip, 0.1)
+            captureAndToggle(0.1)
             print('Picture and Flash Test')
             time.sleep(.1)
 
 
     except KeyboardInterrupt:
         if args.clear:
-            ledRingCommand(strip, Color(0, 0, 0), 0)
-            ledRingCommand(strip, Color(0, 0, 0), 1)
+            LEDArray.ledClearAll()
             print('Picture test exit')

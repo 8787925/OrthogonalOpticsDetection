@@ -7,7 +7,7 @@ import os
 # v3.00
 valid = 0
 
-def imageGreenExtraction(numpyRAWMatrix, fileName, saveFile):
+def imageGreenExtraction(numpyRAWMatrix, fileName, saveFile, mirrorImage = False):
     image = numpyRAWMatrix
     # check size
     if image.size == 1658880:  #Pi3 1536x864
@@ -114,6 +114,12 @@ def imageGreenExtraction(numpyRAWMatrix, fileName, saveFile):
         g1 = M[0].reshape(int(rows/2),int(cols/2))
         r  = M[1].reshape(int(rows/2),int(cols/2))
 
+        if mirrorImage: 
+            r = np.fliplr(r)
+            b = np.fliplr(b)
+            g0 = np.fliplr(g0)
+            g1 = np.fliplr(g1)
+
         if saveFile: 
             # some basic colour correction
             Red   = r * 1
@@ -127,8 +133,8 @@ def imageGreenExtraction(numpyRAWMatrix, fileName, saveFile):
             res = res.astype(np.uint16)
                     
             # save output
-            cv2.imwrite(fileName + ".tif", res)
-        return [g0, g1]
+            cv2.imwrite(fileName + ".tiff", res)
+        return [g0, g1, res]
         # show corrected result
         #result = cv2.resize(res, dsize=(int(cols/4),int(rows/4)), interpolation=cv2.INTER_CUBIC)
     else: 
