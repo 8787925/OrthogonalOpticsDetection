@@ -1,6 +1,6 @@
 
 
-from LargeLEDArray import *
+from OrthogonalOpticsDetection.Documentation.LargeLEDArray import *
 import argparse
 import time
 

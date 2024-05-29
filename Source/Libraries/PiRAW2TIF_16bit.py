@@ -120,7 +120,6 @@ def imageGreenExtraction(numpyRAWMatrix, fileName, saveFile, mirrorImage = False
             g0 = np.fliplr(g0)
             g1 = np.fliplr(g1)
 
-        if saveFile: 
             # some basic colour correction
             Red   = r * 1
             Blue  = b * 1
@@ -131,7 +130,8 @@ def imageGreenExtraction(numpyRAWMatrix, fileName, saveFile, mirrorImage = False
             BGR=np.dstack((Blue,Green,Red)).astype(np.uint16)
             res = cv2.resize(BGR, dsize=(cols,rows), interpolation=cv2.INTER_CUBIC)
             res = res.astype(np.uint16)
-                    
+            
+        if saveFile:      
             # save output
             cv2.imwrite(fileName + ".tiff", res)
         return [g0, g1, res]

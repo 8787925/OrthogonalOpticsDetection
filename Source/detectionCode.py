@@ -12,7 +12,7 @@ from PIL import Image
 import argparse
 from matplotlib import pyplot as plt
 from Libraries import PiRAW2TIF_16bit
-from LargeLEDArray import *
+from OrthogonalOpticsDetection.Documentation.LargeLEDArray import *
 from alignImages import align_images, align_fromHomography
 import pickle
 import os

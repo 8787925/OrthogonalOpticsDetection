@@ -52,9 +52,9 @@ class LargeLEDArray:
         self.LEDstrip.show()
 
     def appendLEDRingAddress_Append(self, color, ring, address): 
-        for rings, addresses in zip(ring, address):   
-            for ringRelativeAddress in addresses:
-                self.ledDirectAddressAppend(color, self.LED_RING_ADDRESSES[rings][0] + ringRelativeAddress)
+        for rings in ring: 
+            for addresses in address: 
+                self.ledDirectAddressAppend(color, self.LED_RING_ADDRESSES[rings] + addresses)
 
     def ledDirectAddress(self, color, address): 
         self.LEDstrip.setPixelColor(address, Color(color[0], color[1], color[2]))
@@ -67,13 +67,13 @@ class LargeLEDArray:
         self.LEDstrip.show()
 
     def ledClearAll(self): 
-        for i in range(self.LEDstrip.numPixels()): 
+        for i in range(self.LEDstrip.numPixels): 
             self.LEDstrip.setPixelColor(i, Color(0, 0, 0))
 
         self.LEDstrip.show()
 
     def setAllLEDs(self, color): 
-        for i in range(self.LEDstrip.numPixels()): 
+        for i in range(self.LEDstrip.numPixels): 
             self.LEDstrip.setPixelColor(i, Color(color[0], color[1], color[2]))
 
         self.LEDstrip.show()
