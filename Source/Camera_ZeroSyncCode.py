@@ -49,11 +49,14 @@ def captureFrame(captures = 1, DO_TIFF = False):
 
 # WebSocket server handler
 async def handler(websocket, path):
+    global cameraIsStarted
     async for message in websocket:
         command = json.loads(message)
         if command['action'] == 'start_camera':
             # Execute the function and get the numpy array
-            cameraIsStarted = startCamera()
+            if cameraIsStarted == False:
+                cameraIsStarted = startCamera()
+            
             if cameraIsStarted: 
                  startResult = {'result': 'success'}
             else:
@@ -100,7 +103,7 @@ async def sendContent(large_array, websocket):
 
 # Start the WebSocket server
 async def main():
-    async with websockets.serve(handler, WEBSOCKET_MASTER, WEBSOCKET_PORT):
+    async with websockets.serve(handler, '0.0.0.0', WEBSOCKET_PORT):
         await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
