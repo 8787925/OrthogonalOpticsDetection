@@ -21,28 +21,36 @@ WEBSOCKET_SLAVE = 'beemonitor.lan'
 WEBSOCKET_PORT = 18873
 FRAGMENT_SIZE = 1024*1024
 
+cameraIsPrimed = False
 cameraIsStarted = False 
 
-picam2a = Picamera2(0)
-camera_configa = picam2a.create_still_configuration(
-        raw = {},
-        queue = False)
-picam2a.configure(camera_configa)
-picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
 
 def startCamera():
-    # Example function that returns a numpy array
-    picam2a.start()
-    return True
+    global cameraIsStarted
+    global cameraIsPrimed
+    picam2a = Picamera2(0)
+    camera_configa = picam2a.create_still_configuration(
+        main={"size": (1920, 1080)},
+        queue = True)
+    picam2a.configure(camera_configa)
+    picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
+    picam2a.start(show_preview=False)
 
-def captureFrame(captures = 1, DO_TIFF = False): 
+    #for i in range(3): 
+    #     myArray = picam2a.capture_array()
+    #     cv2.imwrite('quickCam' + str(i) + '.jpg', myArray)
+
+    cameraIsStarted = True
+    return picam2a
+
+def captureFrame(camera, captures = 1, DO_TIFF = False): 
     data_a = []
     for frame in range(captures): 
             if DO_TIFF:
-                    data_a.append(picam2a.capture_array("raw"))
+                    data_a.append(camera.capture_array("raw"))
                    
             else: 
-                    data_a.append(picam2a.capture_array())
+                    data_a.append(camera.capture_array())
             #img_b = cv2.cvtColor(img2[2], cv2.COLOR_YUV420p2RGB) #alternatively cv2.COLOR_YUV2RGB_I420
             print("Captured frame " + str(frame))
     return data_a
@@ -55,7 +63,7 @@ async def handler(websocket, path):
         if command['action'] == 'start_camera':
             # Execute the function and get the numpy array
             if cameraIsStarted == False:
-                cameraIsStarted = startCamera()
+                cameraInstance = startCamera()
             
             if cameraIsStarted: 
                  startResult = {'result': 'success'}
@@ -67,7 +75,7 @@ async def handler(websocket, path):
 
         elif command['action'] == 'capture':
             if cameraIsStarted:
-                result_array = captureFrame()
+                result_array = captureFrame(camera = cameraInstance)
                 # Convert the numpy array to a list for JSON serialization
                 #sendContent(result_array, websocket)
                 large_array = np.array(result_array[0])
