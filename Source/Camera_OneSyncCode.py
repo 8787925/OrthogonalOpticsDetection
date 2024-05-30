@@ -3,6 +3,8 @@ import websockets
 import json
 import numpy as np
 import io
+import cv2
+import time 
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
@@ -21,6 +23,7 @@ async def client():
         # Send command to execute function
         command = {'action': 'start_camera'}
         await websocket.send(json.dumps(command))
+        #time.sleep(0.5)
         startResult = await websocket.recv()
         startResult = json.loads(startResult)
         if (startResult['result'] == 'success'): 
@@ -40,7 +43,7 @@ async def client():
             buffer = io.BytesIO(full_data)
             buffer.seek(0)
             large_array = np.load(buffer)
-
+            cv2.imwrite('testImage.jpg', large_array)
             print(f"Received array shape: {large_array.shape}")
 
             #large_data = b"".join(full_data)
