@@ -7,8 +7,7 @@ import time
 import cv2
 from Libraries import PiRAW2TIF_16bit
 import io
-from Documentation.LargeLEDArray import *
-
+from Libraries.LargeLEDArray import *
 
 #this code is meant to be ran on a computer who is running the 'sink'
 #of a trigger/sink system.
@@ -60,15 +59,15 @@ def captureFrame(camera, captures = 1, DO_TIFF = False):
 # WebSocket server handler
 async def handler(websocket, path):
     global cameraIsStarted
+    ledArray = LargeLEDArray()
     async for message in websocket:
         command = json.loads(message)
         if command['action'] == 'start_camera':
             # Execute the function and get the numpy array
             if cameraIsStarted == False:
                 cameraInstance = startCamera()
-            ledArray = []
+
             if cameraIsStarted: 
-                 ledArray = LargeLEDArray()
                  startResult = {'result': 'success'}
             else:
                  startResult = {'result': 'failure'}

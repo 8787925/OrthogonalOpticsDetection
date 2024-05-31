@@ -67,13 +67,13 @@ class LargeLEDArray:
         self.LEDstrip.show()
 
     def ledClearAll(self): 
-        for i in range(self.LEDstrip.numPixels): 
+        for i in range(self.LEDstrip.numPixels()): 
             self.LEDstrip.setPixelColor(i, Color(0, 0, 0))
 
         self.LEDstrip.show()
 
     def setAllLEDs(self, color): 
-        for i in range(self.LEDstrip.numPixels): 
+        for i in range(self.LEDstrip.numPixels()): 
             self.LEDstrip.setPixelColor(i, Color(color[0], color[1], color[2]))
 
         self.LEDstrip.show()
