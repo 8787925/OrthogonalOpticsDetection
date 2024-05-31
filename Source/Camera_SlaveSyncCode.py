@@ -31,10 +31,10 @@ def startCamera():
     global cameraIsPrimed
     picam2a = Picamera2(0)
     camera_configa = picam2a.create_still_configuration(
-        main={"size": (1920, 1080)},
+        main={"size": (1920,1080)},
         queue = True)
     picam2a.configure(camera_configa)
-    picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
+    picam2a.set_controls({"ExposureTime": 100000, "AnalogueGain": 5})
     picam2a.start(show_preview=False)
 
     #for i in range(3): 
