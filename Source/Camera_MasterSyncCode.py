@@ -8,6 +8,8 @@ import time
 import cv2
 from Libraries import PiRAW2TIF_16bit
 import io
+from alignImages import *
+import os
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
@@ -20,15 +22,22 @@ WEBSOCKET_MASTER = 'camera0bee.lan'
 WEBSOCKET_SLAVE = 'beemonitor.lan'
 WEBSOCKET_PORT = 18873
 FRAGMENT_SIZE = 1 #indicies
-NUMBER_OF_FRAMES = 10
+NUMBER_OF_FRAMES = 13
+HOMOGRAPHY_CALIBRATION_NAME = 'wallCalibration_image.pickle'
+HomographyMatrix = []
+CALIBRATION_NEEDED = True
+
+if os.path.exists(HOMOGRAPHY_CALIBRATION_NAME): 
+    with open(HOMOGRAPHY_CALIBRATION_NAME, 'rb') as f:
+        HomographyMatrix = pickle.load(f)
+    CALIBRATION_NEEDED = False
 
 picam2a = Picamera2()
 camera_configa = picam2a.create_still_configuration(
-        main={"size": (1920, 1080)},
+        main={"size":(1920,1080)},
         queue = False)
 picam2a.configure(camera_configa)
-picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
-
+picam2a.set_controls({"ExposureTime": 100000, "AnalogueGain": 5})
 
 async def client():
     global picam2a
@@ -63,6 +72,11 @@ async def client():
                 buffer = io.BytesIO(full_data)
                 buffer.seek(0)
                 large_array = np.load(buffer)
+                large_array = np.fliplr(large_array)
+                # Align and correct images
+                    #we now have two corrected images, we need to correct index 1 to match 2
+                #large_array = align_fromHomography(large_array, HomographyMatrix);
+    
                 cv2.imwrite('testImage' + str(i) + '.jpg', large_array)
                 cv2.imwrite('localImageTest' + str(i) + '.jpg', localImage)
                 print(f"Received array shape: {large_array.shape}")
@@ -82,4 +96,26 @@ async def client():
         print("Received numpy array:")
 
 if __name__ == "__main__":
+    if CALIBRATION_NEEDED:
+        rawCalibrationImage = [] 
+        raw16BitImages = []
+        print('No calibration file found, generating optics calibrations')
+        HomographyMatrix = []
+        for z in range(NUMBER_OF_FRAME_PAIRS): 
+            for i in range(NUMBER_OF_CAMERAS): 
+                rawCalibrationImage.append(picam_List[i].capture_array("raw"))
+                raw16BitImages.append(PiRAW2TIF_16bit.imageGreenExtraction(rawCalibrationImage[i], 'calibrationRawImage_Camera_' + str(i), True, CAMERAS_ARE_MIRRORED[i]))
+            print('frame capture ' + str(z) + ' completed out of ' + str(NUMBER_OF_FRAME_PAIRS))
+            #We've collected the images, now we need to generate the homography matrix
+            HomographyMatrix.append(align_images(raw16BitImages[0][2], raw16BitImages[1][2]))
+            print('frame comparison ' + str(z) + ' completed out of ' + str(NUMBER_OF_FRAME_PAIRS))
+            
+        print('Captures complete, generating optics calibration matrix')
+        HomographyMatrix_Output = np.mean(HomographyMatrix, axis=0)
+
+        with open(HOMOGRAPHY_CALIBRATION_NAME, 'wb') as f:
+            pickle.dump(HomographyMatrix_Output, f)
+
+        HomographyMatrix = HomographyMatrix_Output
+
     asyncio.run(client())
