@@ -37,10 +37,6 @@ async def client():
         command = {'action': 'start_camera'}
         await websocket.send(json.dumps(command))
 
-        command = {'action': 'LED_OFF'}
-        await websocket.send(json.dumps(command))
-
-        #time.sleep(0.5)
         startResult = await websocket.recv()
         startResult = json.loads(startResult)
         if (startResult['result'] == 'success'): 
