@@ -7,6 +7,8 @@ import time
 import cv2
 from Libraries import PiRAW2TIF_16bit
 import io
+from Documentation.LargeLEDArray import *
+
 
 #this code is meant to be ran on a computer who is running the 'sink'
 #of a trigger/sink system.
@@ -23,7 +25,7 @@ FRAGMENT_SIZE = 1024*1024
 
 cameraIsPrimed = False
 cameraIsStarted = False 
-
+ledFlashColor = [0, 50, 0]
 
 def startCamera():
     global cameraIsStarted
@@ -64,17 +66,19 @@ async def handler(websocket, path):
             # Execute the function and get the numpy array
             if cameraIsStarted == False:
                 cameraInstance = startCamera()
-            
+            ledArray = []
             if cameraIsStarted: 
+                 ledArray = LargeLEDArray()
                  startResult = {'result': 'success'}
             else:
                  startResult = {'result': 'failure'}
             
+            ledArray.setAllLEDs([0, 0, 0])
             await websocket.send(json.dumps(startResult))
-
 
         elif command['action'] == 'capture':
             if cameraIsStarted:
+                ledArray.setAllLEDs(ledFlashColor)
                 result_array = captureFrame(camera = cameraInstance)
                 # Convert the numpy array to a list for JSON serialization
                 #sendContent(result_array, websocket)
@@ -93,6 +97,9 @@ async def handler(websocket, path):
                 
                 # Send a signal to indicate the end of transmission
                 await websocket.send(b"END")
+
+        elif command['action'] == 'LED_OFF':
+             ledArray.setAllLEDs([0, 0, 0])
 
 async def sendContent(large_array, websocket): 
     # Serialize the array to a binary format

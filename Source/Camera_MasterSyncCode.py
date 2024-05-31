@@ -36,6 +36,10 @@ async def client():
         # Send command to execute function
         command = {'action': 'start_camera'}
         await websocket.send(json.dumps(command))
+
+        command = {'action': 'LED_OFF'}
+        await websocket.send(json.dumps(command))
+
         #time.sleep(0.5)
         startResult = await websocket.recv()
         startResult = json.loads(startResult)
@@ -66,6 +70,9 @@ async def client():
                 cv2.imwrite('testImage' + str(i) + '.jpg', large_array)
                 cv2.imwrite('localImageTest' + str(i) + '.jpg', localImage)
                 print(f"Received array shape: {large_array.shape}")
+            
+            command = {'action': 'LED_OFF'}
+            await websocket.send(json.dumps(command))
             print('Done')
             exit()
             #large_data = b"".join(full_data)
