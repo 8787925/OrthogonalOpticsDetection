@@ -23,7 +23,7 @@ WEBSOCKET_MASTER = 'camera0bee.lan'
 WEBSOCKET_SLAVE = 'beemonitor.lan'
 WEBSOCKET_PORT = 18873
 FRAGMENT_SIZE = 1 #indicies
-NUMBER_OF_FRAMES = 13
+NUMBER_OF_FRAMES = 15
 NUMBER_OF_CALIBRATION_FRAMES = 15
 FIRST_CALIBRATION_FRAME = 7
 HOMOGRAPHY_CALIBRATION_NAME = 'wallCalibration_image_1080.pickle'
@@ -33,6 +33,8 @@ calibrationFramesAccumulated = 0
 rawCalibrationImageSet_1 = []
 rawCalibrationImageSet_2 = []
 NUMBER_OF_CAMERAS = 2
+CAMERA_H_RESOLUTION = 1920
+CAMERA_V_RESOLUTION = 1080
 
 #sensitivity accumulation 
 sensitivityMapNeeded = True
@@ -42,7 +44,7 @@ Sensitivity_Accumulation = []
 Sensitivity_Frames_Accumulated = 0
 NUMBER_OF_SENSITIVITY_FRAMES = 15
 FIRST_SENSITIVITY_FRAME = FIRST_CALIBRATION_FRAME
-DIFFERENCE_GAIN = 20
+DIFFERENCE_GAIN = 5
 DIFFERENCE_FLOOR = 100
 
 if os.path.exists(SENSITIVITY_MAP_NAME): 
@@ -57,7 +59,7 @@ if os.path.exists(HOMOGRAPHY_CALIBRATION_NAME):
 
 localCamera = Picamera2()
 camera_configa = localCamera.create_still_configuration(
-        main={"size":(1920,1080)},
+        main={"size":(CAMERA_H_RESOLUTION,CAMERA_V_RESOLUTION)},
         queue = False)
 localCamera.configure(camera_configa)
 localCamera.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
@@ -186,6 +188,10 @@ async def client():
             
             command = {'action': 'LED_OFF'}
             await websocketObj.send(json.dumps(command))
+
+            command = {'action': 'CAMERA_OFF'}
+            await websocketObj.send(json.dumps(command))
+
             print('Done')
             exit()
             #large_data = b"".join(full_data)
@@ -265,7 +271,7 @@ def sensitivityMapRoutine(accumulateFrame, localFrame, remoteFrame):
         with open(SENSITIVITY_MAP_NAME, 'wb') as f:
             pickle.dump(Sensitivity_Map, f)
 
-        sensitivityImage = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        sensitivityImage = np.zeros((CAMERA_V_RESOLUTION, CAMERA_H_RESOLUTION, 3), dtype=np.uint8)
         
         #Print diff image of all 3 colors
         sensitivityImage[:,:,0] = np.int8(Sensitivity_Map[:,:,0] * 255)
@@ -301,12 +307,12 @@ async def captureFrame(websocket, Frames):
         # Deserialize the binary data back into a NumPy array
         buffer = io.BytesIO(full_data)
         buffer.seek(0)
-        large_array = np.load(buffer)
-        large_array = np.fliplr(large_array)
+        remoteFrame = np.load(buffer)
+        remoteFrame = np.fliplr(remoteFrame)
         print("Frame " + str(i) + " of " + str(NUMBER_OF_CALIBRATION_FRAMES) + " captured")
-
-        cv2.imwrite('remoteCalImg' + str(i) + '.jpg', large_array)
-        cv2.imwrite('localCalImg' + str(i) + '.jpg', localImage)
+        return {"Local": localImage, "Remote": remoteFrame}
+        #cv2.imwrite('remoteCalImg' + str(i) + '.jpg', remoteFrame)
+        #cv2.imwrite('localCalImg' + str(i) + '.jpg', localImage)
 
 
 def calibrationRoutine(accumulateFrames, frame1, frame2): 
