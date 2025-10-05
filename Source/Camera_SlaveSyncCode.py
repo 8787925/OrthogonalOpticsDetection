@@ -21,17 +21,19 @@ WEBSOCKET_MASTER = 'camera0bee.lan'
 WEBSOCKET_SLAVE = 'beemonitor.lan'
 WEBSOCKET_PORT = 18873
 FRAGMENT_SIZE = 1024*1024
+CAMERA_H_RESOLUTION = 1920
+CAMERA_V_RESOLUTION = 1080
 
 cameraIsPrimed = False
 cameraIsStarted = False 
 ledFlashColor = [0, 50, 0]
 
-def startCamera():
+def startCamera(V_res, H_res):
     global cameraIsStarted
     global cameraIsPrimed
     picam2a = Picamera2(0)
     camera_configa = picam2a.create_still_configuration(
-        main={"size": (1920,1080)},
+        main={"size": (H_res,V_res)},
         queue = True)
     picam2a.configure(camera_configa)
     picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
@@ -56,61 +58,74 @@ def captureFrame(camera, captures = 1, DO_TIFF = False):
             print("Captured frame " + str(frame))
     return data_a
 
-# WebSocket server handler
+async def handle_start_camera(command, websocket, state):
+    if not state['cameraIsStarted']:
+        if state['cameraIsPrimed']:
+            state['cameraInstance'].start(show_preview=False)
+        else:
+            state['cameraInstance'] = startCamera(CAMERA_V_RESOLUTION, CAMERA_H_RESOLUTION)
+            state['cameraIsPrimed'] = True
+        state['cameraIsStarted'] = True
+
+    result = {'result': 'success' if state['cameraIsStarted'] else 'failure'}
+    state['ledArray'].setAllLEDs([0, 0, 0])
+    await websocket.send(json.dumps(result))
+
+async def handle_capture(command, websocket, state):
+    if state['cameraIsStarted']:
+        result_array = captureFrame(camera=state['cameraInstance'])
+        large_array = np.array(result_array[0])
+        buffer = io.BytesIO()
+        np.save(buffer, large_array)
+        buffer.seek(0)
+        data = buffer.read()
+        for i in range(0, len(data), FRAGMENT_SIZE):
+            chunk = data[i:i + FRAGMENT_SIZE]
+            await websocket.send(chunk)
+            await websocket.recv()
+        await websocket.send(b"END")
+
+async def handle_camera_off(command, websocket, state):
+    state['cameraInstance'].stop()
+    state['cameraIsStarted'] = False
+
+async def handle_led_on(command, websocket, state):
+    state['ledArray'].setAllLEDs(ledFlashColor)
+
+async def handle_led_off(command, websocket, state):
+    state['ledArray'].setAllLEDs([0, 0, 0])
+
+async def handle_set_led_color(command, websocket, state):
+    global ledFlashColor
+    if 'color' in command:
+        ledFlashColor = command['color']
+        result = {'result': 'success', 'color': ledFlashColor}
+    else:
+        result = {'result': 'error', 'message': 'No color specified'}
+    await websocket.send(json.dumps(result))
+
+ACTION_HANDLERS = {
+    'start_camera': handle_start_camera,
+    'capture': handle_capture,
+    'CAMERA_OFF': handle_camera_off,
+    'LED_ON': handle_led_on,
+    'LED_OFF': handle_led_off,
+    'SET_LED_COLOR': handle_set_led_color,
+}
+
 async def handler(websocket, path):
-    global cameraIsStarted
-    global cameraIsPrimed
-    ledArray = LargeLEDArray()
+    state = {
+        'cameraIsPrimed': False,
+        'cameraIsStarted': False,
+        'cameraInstance': None,
+        'ledArray': LargeLEDArray(),
+    }
     async for message in websocket:
         command = json.loads(message)
-        if command['action'] == 'start_camera':
-            # Execute the function and get the numpy array
-            if cameraIsStarted == False:
-                if cameraIsPrimed:
-                     cameraInstance.start(show_preview=False)
-                else: 
-                    cameraInstance = startCamera()
-                    cameraIsPrimed = True
-                
-                cameraIsStarted = True
-
-            if cameraIsStarted: 
-                 startResult = {'result': 'success'}
-            else:
-                 startResult = {'result': 'failure'}
-            
-            ledArray.setAllLEDs([0, 0, 0])
-            await websocket.send(json.dumps(startResult))
-        elif command['action'] == 'capture':
-            if cameraIsStarted:
-                #ledArray.setAllLEDs(ledFlashColor)
-                result_array = captureFrame(camera = cameraInstance)
-                # Convert the numpy array to a list for JSON serialization
-                #sendContent(result_array, websocket)
-                large_array = np.array(result_array[0])
-                buffer = io.BytesIO()
-                np.save(buffer, large_array)
-                buffer.seek(0)
-                data = buffer.read()
-
-                # Send the binary data in chunks
-                for i in range(0, len(data), FRAGMENT_SIZE):
-                    chunk = data[i:i + FRAGMENT_SIZE]
-                    #print("Sending " + str(i))
-                    await websocket.send(chunk)
-                    okToSend = await websocket.recv()
-                
-                # Send a signal to indicate the end of transmission
-                await websocket.send(b"END")
-        elif command['action'] == 'CAMERA_OFF':
-            cameraInstance.stop()
-            cameraIsStarted = False
-
-        elif command['action'] == 'LED_ON':
-             ledArray.setAllLEDs(ledFlashColor)
-
-        elif command['action'] == 'LED_OFF':
-             ledArray.setAllLEDs([0, 0, 0])
+        action = command.get('action')
+        handler_func = ACTION_HANDLERS.get(action)
+        if handler_func:
+            await handler_func(command, websocket, state)
 
 async def sendContent(large_array, websocket): 
     # Serialize the array to a binary format

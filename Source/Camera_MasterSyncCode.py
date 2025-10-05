@@ -11,6 +11,7 @@ import io
 from alignImages import *
 import os
 from matplotlib import pyplot as plt
+import pickle
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
@@ -64,145 +65,161 @@ camera_configa = localCamera.create_still_configuration(
 localCamera.configure(camera_configa)
 localCamera.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
 
-async def client():
-    global localCamera
-    async with websockets.connect("ws://" + WEBSOCKET_SLAVE + ":" + str(WEBSOCKET_PORT)) as websocketObj:
-        # Send command to execute function
-        command = {'action': 'start_camera'}
-        await websocketObj.send(json.dumps(command))
-        localCalibrationFrame = []
-        remoteCalibrationFrame = []
-        startResult = await websocketObj.recv()
-        startResult = json.loads(startResult)
-        if (startResult['result'] == 'success'): 
-            #good to capture locally
-            time.sleep(1)
-            localCamera.start(show_preview=False)
-            
-            #if there's no homography already
-            if CALIBRATION_NEEDED:
-                # perform calibration routine
-                print("Performing homography calibration")
-                for i in range(NUMBER_OF_CALIBRATION_FRAMES): 
-                    localCalibrationFrame = localCamera.capture_array()
-                    command['action'] = 'capture'
-
-                    #capture remotely
-                    await websocketObj.send(json.dumps(command))
-
-                    full_data = bytearray()
-                    while True:
-                        chunk = await websocketObj.recv()
-                        if chunk == b"END":
-                            break
-                        full_data.extend(chunk)
-                        await websocketObj.send("Ok")
-                    
-                    # Deserialize the binary data back into a NumPy array
-                    buffer = io.BytesIO(full_data)
-                    buffer.seek(0)
-                    remoteCalibrationFrame = np.load(buffer)
-                    remoteCalibrationFrame = np.fliplr(remoteCalibrationFrame)
-                    print("Frame " + str(i) + " of " + str(NUMBER_OF_CALIBRATION_FRAMES) + " captured")
-
-                    cv2.imwrite('remoteCalImg' + str(i) + '.jpg', remoteCalibrationFrame)
-                    cv2.imwrite('localCalImg' + str(i) + '.jpg', localCalibrationFrame)
-                    if i>= FIRST_CALIBRATION_FRAME: 
-                        calibrationRoutine(True, localCalibrationFrame, remoteCalibrationFrame)
-
-                command['action'] = 'CAMERA_OFF'
-
-                #turn off camera
-                await websocketObj.send(json.dumps(command))
-                print("Calculating Homography")
-                calibrationRoutine(False, localCalibrationFrame, remoteCalibrationFrame)
-
-                if sensitivityMapNeeded: 
-                    command = {'action': 'start_camera'}
-                    await websocketObj.send(json.dumps(command))
-                    startResult = await websocketObj.recv()
-                    startResult = json.loads(startResult)
-                    if (startResult['result'] == 'success'):
-                        #then we're good to get some frames and send them for processing 
-                        for i in range(NUMBER_OF_SENSITIVITY_FRAMES):
-                            localSensitivityFrame = localCamera.capture_array()
-                            command['action'] = 'capture'
-
-                            #capture remotely
-                            await websocketObj.send(json.dumps(command))
-
-                            full_data = bytearray()
-                            while True:
-                                chunk = await websocketObj.recv()
-                                if chunk == b"END":
-                                    break
-                                full_data.extend(chunk)
-                                await websocketObj.send("Ok")
-                            
-                            # Deserialize the binary data back into a NumPy array
-                            buffer = io.BytesIO(full_data)
-                            buffer.seek(0)
-                            remoteSensitivityFrame = np.load(buffer)
-                            remoteSensitivityFrame = np.fliplr(remoteSensitivityFrame)
-                            
-                            if i >= FIRST_SENSITIVITY_FRAME:
-                                localSensitivityFrame = align_fromHomography(localSensitivityFrame, HomographyMatrix);
-                                sensitivityMapRoutine(True, localSensitivityFrame, remoteSensitivityFrame)
-
-                        sensitivityMapRoutine(False, localSensitivityFrame, remoteSensitivityFrame)
-
-            for i in range(NUMBER_OF_FRAMES):
-                command = {'action': 'LED_ON'}
-                await websocketObj.send(json.dumps(command))
-                time.sleep(0.5)
-                localFrame = localCamera.capture_array()
-                command['action'] = 'capture'
-
-                #capture remotely
-                await websocketObj.send(json.dumps(command))
-
-                full_data = bytearray()
-                while True:
-                    chunk = await websocketObj.recv()
-                    if chunk == b"END":
-                        break
-                    full_data.extend(chunk)
-                    await websocketObj.send("Ok")
-                
-                # Deserialize the binary data back into a NumPy array
-                buffer = io.BytesIO(full_data)
-                buffer.seek(0)
-                remoteFrame = np.load(buffer)
-                remoteFrame = np.fliplr(remoteFrame)
-                # Align and correct images
-                    #we now have two corrected images, we need to correct index 1 to match 2
-                localFrame = align_fromHomography(localFrame, HomographyMatrix);
+async def send_command_and_receive_data(websocket, command):
+    """Send a command and receive binary data response"""
+    await websocket.send(json.dumps(command))
     
-                cv2.imwrite('testImage' + str(i) + '.jpg', remoteFrame)
-                cv2.imwrite('localImageTest' + str(i) + '.jpg', localFrame)
-                differenceImage = performDifferenceIdentity(localFrame, remoteFrame)
-                
-                cv2.imwrite('differneceImage' + str(i) + '.jpg', differenceImage)
+    full_data = bytearray()
+    while True:
+        chunk = await websocket.recv()
+        if chunk == b"END":
+            break
+        full_data.extend(chunk)
+        await websocket.send("Ok")
+    
+    # Deserialize the binary data back into a NumPy array
+    buffer = io.BytesIO(full_data)
+    buffer.seek(0)
+    remote_frame = np.load(buffer)
+    return np.fliplr(remote_frame)
 
-                print(f"Received array shape: {remoteFrame.shape}")
-            
-            command = {'action': 'LED_OFF'}
-            await websocketObj.send(json.dumps(command))
+async def start_remote_camera(websocket):
+    """Start the remote camera and return success status"""
+    command = {'action': 'start_camera'}
+    await websocket.send(json.dumps(command))
+    start_result = await websocket.recv()
+    start_result = json.loads(start_result)
+    return start_result['result'] == 'success'
 
-            command = {'action': 'CAMERA_OFF'}
-            await websocketObj.send(json.dumps(command))
+async def perform_calibration_routine(websocket):
+    """Perform homography calibration between local and remote cameras"""
+    global CALIBRATION_NEEDED, HomographyMatrix
+    
+    if not CALIBRATION_NEEDED:
+        return True
+        
+    print("Performing homography calibration")
+    local_frames = []
+    remote_frames = []
+    
+    for i in range(NUMBER_OF_CALIBRATION_FRAMES):
+        local_frame = localCamera.capture_array()
+        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+        
+        print(f"Frame {i} of {NUMBER_OF_CALIBRATION_FRAMES} captured")
+        cv2.imwrite(f'remoteCalImg{i}.jpg', remote_frame)
+        cv2.imwrite(f'localCalImg{i}.jpg', local_frame)
+        
+        if i >= FIRST_CALIBRATION_FRAME:
+            local_frames.append(local_frame)
+            remote_frames.append(remote_frame)
+    
+    await websocket.send(json.dumps({'action': 'CAMERA_OFF'}))
+    print("Calculating Homography")
+    
+    # Calculate homography matrices
+    homography_matrices = []
+    for j, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
+        homography_matrices.append(align_images(local_frame, remote_frame))
+        print(f'Frame comparison {j} completed out of {len(local_frames)}')
+    
+    # Save homography matrix
+    HomographyMatrix = np.mean(homography_matrices, axis=0)
+    with open(HOMOGRAPHY_CALIBRATION_NAME, 'wb') as f:
+        pickle.dump(HomographyMatrix, f)
+    
+    CALIBRATION_NEEDED = False
+    return True
 
-            print('Done')
-            exit()
-            #large_data = b"".join(full_data)
-            #captureResult = await websocket.recv()
-            #captureResult = np.array(json.loads(captureResult))
-       
-        else: 
-            #didn't work
-            exit()
+async def perform_sensitivity_mapping(websocket):
+    """Generate sensitivity mapping between cameras"""
+    global sensitivityMapNeeded
+    
+    if not sensitivityMapNeeded:
+        return True
+        
+    if not await start_remote_camera(websocket):
+        return False
+        
+    print("Performing sensitivity mapping")
+    local_frames = []
+    remote_frames = []
+    
+    for i in range(NUMBER_OF_SENSITIVITY_FRAMES):
+        local_frame = localCamera.capture_array()
+        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+        
+        if i >= FIRST_SENSITIVITY_FRAME:
+            aligned_local = align_fromHomography(local_frame, HomographyMatrix)
+            local_frames.append(aligned_local)
+            remote_frames.append(remote_frame)
+    
+    # Process sensitivity data
+    sensitivityMapRoutine(False, local_frames, remote_frames)
+    return True
 
-        print("Received numpy array:")
+async def perform_detection_sequence(websocket):
+    """Main detection sequence with LED flashing"""
+    print("Starting detection sequence")
+    
+    for i in range(NUMBER_OF_FRAMES):
+        # Turn on LED
+        await websocket.send(json.dumps({'action': 'LED_ON'}))
+        time.sleep(0.5)
+        
+        # Capture frames
+        local_frame = localCamera.capture_array()
+        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+        
+        # Align and process images
+        aligned_local = align_fromHomography(local_frame, HomographyMatrix)
+        
+        cv2.imwrite(f'testImage{i}.jpg', remote_frame)
+        cv2.imwrite(f'localImageTest{i}.jpg', aligned_local)
+        
+        # Perform difference detection
+        difference_image = performDifferenceIdentity(aligned_local, remote_frame)
+        cv2.imwrite(f'differenceImage{i}.jpg', difference_image)
+        
+        print(f"Processed frame {i+1}/{NUMBER_OF_FRAMES}, shape: {remote_frame.shape}")
+    
+    # Turn off LED
+    await websocket.send(json.dumps({'action': 'LED_OFF'}))
+    print('Detection sequence complete')
+
+async def client():
+    """Main client function with improved structure"""
+    global localCamera
+    
+    async with websockets.connect(f"ws://{WEBSOCKET_SLAVE}:{WEBSOCKET_PORT}") as websocket:
+        # Start remote camera
+        if not await start_remote_camera(websocket):
+            print("Failed to start remote camera")
+            return
+        
+        # Start local camera
+        time.sleep(1)
+        localCamera.start(show_preview=False)
+        
+        # Perform calibration if needed
+        if CALIBRATION_NEEDED:
+            if not await perform_calibration_routine(websocket):
+                print("Calibration failed")
+                return
+        
+        # Perform sensitivity mapping if needed
+        if sensitivityMapNeeded:
+            if not await perform_sensitivity_mapping(websocket):
+                print("Sensitivity mapping failed")
+                return
+        
+        # Restart remote camera for detection
+        if not await start_remote_camera(websocket):
+            print("Failed to restart remote camera")
+            return
+        
+        # Run main detection sequence
+        await perform_detection_sequence(websocket)
 
 def performDifferenceIdentity(localFrame, remoteFrame): 
     #subtract the two images to create a difference image
@@ -249,98 +266,56 @@ def performDifferenceIdentity(localFrame, remoteFrame):
     #Mark the floor-clearing areas in frame1 and output
     return localFrame
 
-def sensitivityMapRoutine(accumulateFrame, localFrame, remoteFrame): 
-    # accumulate an arbitrary number of frames
-    global Sensitivity_Accumulation
-    global Sensitivity_Map
-    global Sensitivity_Frames_Accumulated
+def sensitivityMapRoutine(accumulate_frame, local_frames, remote_frames): 
+    """Generate sensitivity map from multiple frame pairs"""
+    global Sensitivity_Accumulation, Sensitivity_Map, Sensitivity_Frames_Accumulated
     
-    if accumulateFrame: 
-        differenceFrame = np.float32(localFrame)-np.float32(remoteFrame)
-        cv2.imwrite('sensitivity_Diff' + str(Sensitivity_Frames_Accumulated) + '.jpg', np.uint8(np.abs(differenceFrame)))
-        cv2.imwrite('sensitivity_Local' + str(Sensitivity_Frames_Accumulated) + '.jpg', np.abs(localFrame))
-        cv2.imwrite('sensitivity_Remote' + str(Sensitivity_Frames_Accumulated) + '.jpg', np.abs(remoteFrame))
-        Sensitivity_Accumulation.append(differenceFrame)
-        Sensitivity_Frames_Accumulated = Sensitivity_Frames_Accumulated + 1
-    elif Sensitivity_Frames_Accumulated>0:
-        stackedSensitivity = np.stack(Sensitivity_Accumulation, axis=0)
-        floatMap = np.float32(np.mean(stackedSensitivity, axis=0))
-        floatMap = np.abs(floatMap)
-        Sensitivity_Map = np.reciprocal(floatMap + 1) #+1 here accounts for the fact that a perfect match approaches 0
-
-        with open(SENSITIVITY_MAP_NAME, 'wb') as f:
-            pickle.dump(Sensitivity_Map, f)
-
-        sensitivityImage = np.zeros((CAMERA_V_RESOLUTION, CAMERA_H_RESOLUTION, 3), dtype=np.uint8)
+    if accumulate_frame:
+        # This mode is no longer used with the new structure
+        return
+    
+    if not local_frames or not remote_frames:
+        return
         
-        #Print diff image of all 3 colors
-        sensitivityImage[:,:,0] = np.int8(Sensitivity_Map[:,:,0] * 255)
-        cv2.imwrite('./sensitivityMatrixBlue.png', sensitivityImage)
-        sensitivityImage[:,:,0] = sensitivityImage[:,:,0] * 0
+    # Process all frame pairs
+    difference_frames = []
+    for i, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
+        difference_frame = np.float32(local_frame) - np.float32(remote_frame)
+        difference_frames.append(difference_frame)
         
-        sensitivityImage[:,:,1] = np.int8(Sensitivity_Map[:,:,1] * 255)
-        cv2.imwrite('./sensitivityMatrixGreen.png', sensitivityImage)
-        sensitivityImage[:,:,1] = sensitivityImage[:,:,1] * 0
+        # Save individual frames for debugging
+        cv2.imwrite(f'sensitivity_Diff{i}.jpg', np.uint8(np.abs(difference_frame)))
+        cv2.imwrite(f'sensitivity_Local{i}.jpg', np.abs(local_frame))
+        cv2.imwrite(f'sensitivity_Remote{i}.jpg', np.abs(remote_frame))
+    
+    # Calculate mean sensitivity map
+    stacked_sensitivity = np.stack(difference_frames, axis=0)
+    float_map = np.float32(np.mean(stacked_sensitivity, axis=0))
+    float_map = np.abs(float_map)
+    Sensitivity_Map = np.reciprocal(float_map + 1)  # +1 accounts for perfect match approaching 0
 
-        sensitivityImage[:,:,2] = np.int8(Sensitivity_Map[:,:,2] * 255)
-        cv2.imwrite('./sensitivityMatrixRed.png', sensitivityImage)
-        sensitivityImage[:,:,2] = sensitivityImage[:,:,2] * 0
+    # Save sensitivity map
+    with open(SENSITIVITY_MAP_NAME, 'wb') as f:
+        pickle.dump(Sensitivity_Map, f)
 
-async def captureFrame(websocket, Frames): 
-    global localCamera
-    command = []
-    for i in range(Frames): 
-        localImage = localCamera.capture_array()
-        command['action'] = 'capture'
+    # Create visualization images
+    sensitivity_image = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    
+    # Blue channel
+    sensitivity_image[:,:,0] = np.uint8(Sensitivity_Map[:,:,0] * 255)
+    cv2.imwrite('./sensitivityMatrixBlue.png', sensitivity_image)
+    sensitivity_image[:,:,0] = 0
+    
+    # Green channel
+    sensitivity_image[:,:,1] = np.uint8(Sensitivity_Map[:,:,1] * 255)
+    cv2.imwrite('./sensitivityMatrixGreen.png', sensitivity_image)
+    sensitivity_image[:,:,1] = 0
 
-        #capture remotely
-        await websocket.send(json.dumps(command))
+    # Red channel
+    sensitivity_image[:,:,2] = np.uint8(Sensitivity_Map[:,:,2] * 255)
+    cv2.imwrite('./sensitivityMatrixRed.png', sensitivity_image)
+    
+    print("Sensitivity mapping complete")
 
-        full_data = bytearray()
-        while True:
-            chunk = await websocket.recv()
-            if chunk == b"END":
-                break
-            full_data.extend(chunk)
-            await websocket.send("Ok")
-        
-        # Deserialize the binary data back into a NumPy array
-        buffer = io.BytesIO(full_data)
-        buffer.seek(0)
-        remoteFrame = np.load(buffer)
-        remoteFrame = np.fliplr(remoteFrame)
-        print("Frame " + str(i) + " of " + str(NUMBER_OF_CALIBRATION_FRAMES) + " captured")
-        return {"Local": localImage, "Remote": remoteFrame}
-        #cv2.imwrite('remoteCalImg' + str(i) + '.jpg', remoteFrame)
-        #cv2.imwrite('localCalImg' + str(i) + '.jpg', localImage)
-
-
-def calibrationRoutine(accumulateFrames, frame1, frame2): 
-    global rawCalibrationImageSet_1
-    global rawCalibrationImageSet_2
-    global calibrationFramesAccumulated
-    global HomographyMatrix
-
-    if calibrationFramesAccumulated == 0:
-        rawCalibrationImageSet_1 = [] 
-
-    if accumulateFrames: 
-        rawCalibrationImageSet_1.append(frame1)
-        rawCalibrationImageSet_2.append(frame2)
-        calibrationFramesAccumulated = calibrationFramesAccumulated + 1
-    else: 
-        HomographyMatrix = []
-        for z in range(calibrationFramesAccumulated): 
-            #We've collected the images, now we need to generate the homography matrix
-            HomographyMatrix.append(align_images(rawCalibrationImageSet_1[z], rawCalibrationImageSet_2[z]))
-            print('frame comparison ' + str(z) + ' completed out of ' + str(calibrationFramesAccumulated))
-            
-        print('Captures complete, generating optics calibration matrix')
-        HomographyMatrix_Output = np.mean(HomographyMatrix, axis=0)
-
-        with open(HOMOGRAPHY_CALIBRATION_NAME, 'wb') as f:
-            pickle.dump(HomographyMatrix_Output, f)
-
-        HomographyMatrix = HomographyMatrix_Output
 if __name__ == "__main__":
     asyncio.run(client())
