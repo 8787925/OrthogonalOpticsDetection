@@ -34,7 +34,7 @@ def startCamera():
         main={"size": (1920,1080)},
         queue = True)
     picam2a.configure(camera_configa)
-    picam2a.set_controls({"ExposureTime": 100000, "AnalogueGain": 5})
+    picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
     picam2a.start(show_preview=False)
 
     #for i in range(3): 
@@ -59,13 +59,20 @@ def captureFrame(camera, captures = 1, DO_TIFF = False):
 # WebSocket server handler
 async def handler(websocket, path):
     global cameraIsStarted
+    global cameraIsPrimed
     ledArray = LargeLEDArray()
     async for message in websocket:
         command = json.loads(message)
         if command['action'] == 'start_camera':
             # Execute the function and get the numpy array
             if cameraIsStarted == False:
-                cameraInstance = startCamera()
+                if cameraIsPrimed:
+                     cameraInstance.start(show_preview=False)
+                else: 
+                    cameraInstance = startCamera()
+                    cameraIsPrimed = True
+                
+                cameraIsStarted = True
 
             if cameraIsStarted: 
                  startResult = {'result': 'success'}
@@ -74,10 +81,9 @@ async def handler(websocket, path):
             
             ledArray.setAllLEDs([0, 0, 0])
             await websocket.send(json.dumps(startResult))
-
         elif command['action'] == 'capture':
             if cameraIsStarted:
-                ledArray.setAllLEDs(ledFlashColor)
+                #ledArray.setAllLEDs(ledFlashColor)
                 result_array = captureFrame(camera = cameraInstance)
                 # Convert the numpy array to a list for JSON serialization
                 #sendContent(result_array, websocket)
@@ -96,6 +102,12 @@ async def handler(websocket, path):
                 
                 # Send a signal to indicate the end of transmission
                 await websocket.send(b"END")
+        elif command['action'] == 'CAMERA_OFF':
+            cameraInstance.stop()
+            cameraIsStarted = False
+
+        elif command['action'] == 'LED_ON':
+             ledArray.setAllLEDs(ledFlashColor)
 
         elif command['action'] == 'LED_OFF':
              ledArray.setAllLEDs([0, 0, 0])
