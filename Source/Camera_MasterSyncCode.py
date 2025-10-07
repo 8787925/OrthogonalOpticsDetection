@@ -171,6 +171,110 @@ async def send_command_and_receive_data(websocket, command):
         logger.error(f"Error in send_command_and_receive_data: {e}")
         raise
 
+async def start_frame_buffering(websocket):
+    """Start buffering frames on the slave side"""
+    try:
+        await send_command_with_retry(websocket, {'action': 'start_buffering'})
+        response = await websocket.recv()
+        result = json.loads(response)
+        if result.get('result') == 'success':
+            logger.info("Frame buffering started on slave")
+            return True
+        else:
+            logger.error(f"Failed to start frame buffering: {result.get('message', 'Unknown error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error starting frame buffering: {e}")
+        return False
+
+async def capture_buffered_frame(websocket):
+    """Request slave to capture a frame and store it in buffer"""
+    try:
+        await send_command_with_retry(websocket, {'action': 'capture_buffered'})
+        response = await websocket.recv()
+        result = json.loads(response)
+        if result.get('result') == 'success':
+            logger.debug("Buffered frame captured on slave")
+            return True
+        else:
+            logger.error(f"Failed to capture buffered frame: {result.get('message', 'Unknown error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error capturing buffered frame: {e}")
+        return False
+
+async def transfer_all_buffered_frames(websocket):
+    """Request all buffered frames from slave and return them as a list"""
+    try:
+        await send_command_with_retry(websocket, {'action': 'transfer_all_frames'})
+        
+        # Receive the number of frames first
+        frame_count_data = await websocket.recv()
+        frame_count = json.loads(frame_count_data)['frame_count']
+        await websocket.send("Ok")
+        logger.info(f"Receiving {frame_count} buffered frames from slave")
+        
+        frames = []
+        for i in range(frame_count):
+            logger.info(f"Receiving frame {i+1}/{frame_count}")
+            
+            # Receive frame data
+            full_data = bytearray()
+            while True:
+                chunk = await websocket.recv()
+                if chunk == b"FRAME_END":
+                    break
+                full_data.extend(chunk)
+                await websocket.send("Ok")
+            
+            # Deserialize the frame
+            buffer = io.BytesIO(full_data)
+            buffer.seek(0)
+            remote_frame = np.load(buffer)
+            frames.append(np.fliplr(remote_frame))
+        
+        logger.info(f"Successfully received {len(frames)} buffered frames")
+        return frames
+        
+    except ConnectionClosed:
+        logger.error("Connection closed during buffered frame transfer")
+        raise
+    except Exception as e:
+        logger.error(f"Error in transfer_all_buffered_frames: {e}")
+        raise
+
+async def stop_frame_buffering(websocket):
+    """Stop buffering frames on the slave side"""
+    try:
+        await send_command_with_retry(websocket, {'action': 'stop_buffering'})
+        response = await websocket.recv()
+        result = json.loads(response)
+        if result.get('result') == 'success':
+            logger.info("Frame buffering stopped on slave")
+            return True
+        else:
+            logger.error(f"Failed to stop frame buffering: {result.get('message', 'Unknown error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error stopping frame buffering: {e}")
+        return False
+
+async def clear_slave_buffer(websocket):
+    """Clear the frame buffer on the slave side"""
+    try:
+        await send_command_with_retry(websocket, {'action': 'clear_buffer'})
+        response = await websocket.recv()
+        result = json.loads(response)
+        if result.get('result') == 'success':
+            logger.info("Slave frame buffer cleared")
+            return True
+        else:
+            logger.error(f"Failed to clear slave buffer: {result.get('message', 'Unknown error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error clearing slave buffer: {e}")
+        return False
+
 async def start_remote_camera(websocket):
     """Start the remote camera and return success status with retry logic"""
     try:
@@ -189,36 +293,64 @@ async def start_remote_camera(websocket):
         return False
 
 async def perform_calibration_routine(websocket):
-    """Perform homography calibration between local and remote cameras"""
+    """Perform homography calibration between local and remote cameras using buffered approach"""
     global CALIBRATION_NEEDED, HomographyMatrix
     
     if not CALIBRATION_NEEDED:
         return True
         
     print("Performing homography calibration")
-    local_frames = []
-    remote_frames = []
     
+    # Start buffering on slave
+    if not await start_frame_buffering(websocket):
+        logger.error("Failed to start frame buffering for calibration")
+        return False
+    
+    local_frames = []
+    
+    # Capture all calibration frames
     for i in range(NUMBER_OF_CALIBRATION_FRAMES):
         local_frame = localCamera.capture_array()
-        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
         
-        print(f"Frame {i} of {NUMBER_OF_CALIBRATION_FRAMES} captured")
-        cv2.imwrite(f'remoteCalImg{i}.jpg', remote_frame)
+        # Save local frame for debugging
         cv2.imwrite(f'localCalImg{i}.jpg', local_frame)
         
-        if i >= FIRST_CALIBRATION_FRAME:
-            local_frames.append(local_frame)
-            remote_frames.append(remote_frame)
+        # Request slave to capture and buffer frame
+        if not await capture_buffered_frame(websocket):
+            logger.error(f"Failed to capture buffered calibration frame {i}")
+            return False
+        
+        print(f"Frame {i} of {NUMBER_OF_CALIBRATION_FRAMES} captured")
+        local_frames.append(local_frame)
+    
+    # Stop buffering and transfer all frames
+    if not await stop_frame_buffering(websocket):
+        logger.error("Failed to stop frame buffering for calibration")
+        return False
+    
+    # Transfer all buffered frames from slave
+    remote_frames = await transfer_all_buffered_frames(websocket)
+    
+    if len(remote_frames) != len(local_frames):
+        logger.error(f"Calibration frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
+        return False
+    
+    # Save remote frames for debugging
+    for i, remote_frame in enumerate(remote_frames):
+        cv2.imwrite(f'remoteCalImg{i}.jpg', remote_frame)
     
     await websocket.send(json.dumps({'action': 'CAMERA_OFF'}))
     print("Calculating Homography")
     
+    # Use frames starting from FIRST_CALIBRATION_FRAME for homography calculation
+    calibration_local_frames = local_frames[FIRST_CALIBRATION_FRAME:]
+    calibration_remote_frames = remote_frames[FIRST_CALIBRATION_FRAME:]
+    
     # Calculate homography matrices
     homography_matrices = []
-    for j, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
+    for j, (local_frame, remote_frame) in enumerate(zip(calibration_local_frames, calibration_remote_frames)):
         homography_matrices.append(align_images(local_frame, remote_frame))
-        print(f'Frame comparison {j} completed out of {len(local_frames)}')
+        print(f'Frame comparison {j} completed out of {len(calibration_local_frames)}')
     
     # Save homography matrix
     HomographyMatrix = np.mean(homography_matrices, axis=0)
@@ -229,7 +361,7 @@ async def perform_calibration_routine(websocket):
     return True
 
 async def perform_sensitivity_mapping(websocket):
-    """Generate sensitivity mapping between cameras"""
+    """Generate sensitivity mapping between cameras using buffered approach"""
     global sensitivityMapNeeded
     
     if not sensitivityMapNeeded:
@@ -239,38 +371,101 @@ async def perform_sensitivity_mapping(websocket):
         return False
         
     print("Performing sensitivity mapping")
-    local_frames = []
-    remote_frames = []
     
+    # Start buffering on slave
+    if not await start_frame_buffering(websocket):
+        logger.error("Failed to start frame buffering for sensitivity mapping")
+        return False
+    
+    local_frames = []
+    
+    # Capture all sensitivity frames
     for i in range(NUMBER_OF_SENSITIVITY_FRAMES):
         local_frame = localCamera.capture_array()
-        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+        local_frames.append(local_frame)
         
+        # Request slave to capture and buffer frame
+        if not await capture_buffered_frame(websocket):
+            logger.error(f"Failed to capture buffered sensitivity frame {i}")
+            return False
+    
+    # Stop buffering and transfer all frames
+    if not await stop_frame_buffering(websocket):
+        logger.error("Failed to stop frame buffering for sensitivity mapping")
+        return False
+    
+    # Transfer all buffered frames from slave
+    remote_frames = await transfer_all_buffered_frames(websocket)
+    
+    if len(remote_frames) != len(local_frames):
+        logger.error(f"Sensitivity frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
+        return False
+    
+    # Process only frames starting from FIRST_SENSITIVITY_FRAME
+    processed_local_frames = []
+    processed_remote_frames = []
+    
+    for i, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
         if i >= FIRST_SENSITIVITY_FRAME:
             aligned_local = align_fromHomography(local_frame, HomographyMatrix)
-            local_frames.append(aligned_local)
-            remote_frames.append(remote_frame)
+            processed_local_frames.append(aligned_local)
+            processed_remote_frames.append(remote_frame)
     
     # Process sensitivity data
-    sensitivityMapRoutine(False, local_frames, remote_frames)
+    sensitivityMapRoutine(False, processed_local_frames, processed_remote_frames)
     return True
 
 async def perform_detection_sequence(websocket):
-    """Main detection sequence with LED flashing and error handling"""
-    logger.info("Starting detection sequence")
+    """Main detection sequence with LED flashing and buffered frame transfer"""
+    logger.info("Starting detection sequence with buffered frame transfer")
     
     try:
+        # Start buffering on slave
+        if not await start_frame_buffering(websocket):
+            logger.error("Failed to start frame buffering")
+            return False
+        
+        # Buffer to store local frames
+        local_frames = []
+        
+        # Capture all frames first (buffered)
         for i in range(NUMBER_OF_FRAMES):
-            logger.info(f"Processing frame {i+1}/{NUMBER_OF_FRAMES}")
+            logger.info(f"Capturing frame {i+1}/{NUMBER_OF_FRAMES}")
             
             # Turn on LED
             await send_command_with_retry(websocket, {'action': 'LED_ON'})
             time.sleep(0.5)
             
-            # Capture frames
+            # Capture local frame and store in buffer
             local_frame = localCamera.capture_array()
-            remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+            local_frames.append(local_frame)
             
+            # Request slave to capture and buffer frame
+            if not await capture_buffered_frame(websocket):
+                logger.error(f"Failed to capture buffered frame {i+1}")
+                return False
+            
+            logger.info(f"Buffered frame {i+1}/{NUMBER_OF_FRAMES}")
+        
+        # Turn off LED after all captures
+        await send_command_with_retry(websocket, {'action': 'LED_OFF'})
+        
+        # Stop buffering on slave
+        if not await stop_frame_buffering(websocket):
+            logger.error("Failed to stop frame buffering")
+            return False
+        
+        # Transfer all buffered frames from slave
+        logger.info("Transferring all buffered frames from slave")
+        remote_frames = await transfer_all_buffered_frames(websocket)
+        
+        if len(remote_frames) != len(local_frames):
+            logger.error(f"Frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
+            return False
+        
+        # Process all frame pairs
+        logger.info("Processing all captured frame pairs")
+        for i, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
             # Align and process images
             aligned_local = align_fromHomography(local_frame, HomographyMatrix)
             cv2.imwrite(f'RemoteImage{i}.jpg', remote_frame)
@@ -282,8 +477,6 @@ async def perform_detection_sequence(websocket):
             
             logger.info(f"Processed frame {i+1}/{NUMBER_OF_FRAMES}, shape: {remote_frame.shape}")
         
-        # Turn off LED
-        await send_command_with_retry(websocket, {'action': 'LED_OFF'})
         logger.info('Detection sequence completed successfully')
         return True
         

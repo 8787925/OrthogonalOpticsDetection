@@ -92,6 +92,14 @@ def cleanup_resources(state):
         if state.get('ledArray'):
             logger.info("Turning off LEDs...")
             state['ledArray'].setAllLEDs([0, 0, 0])
+        
+        # Clear frame buffer
+        if 'frame_buffer' in state:
+            buffer_size = len(state['frame_buffer'])
+            state['frame_buffer'] = []
+            state['buffering_active'] = False
+            if buffer_size > 0:
+                logger.info(f"Cleared frame buffer ({buffer_size} frames)")
             
         logger.info("Resources cleaned up successfully")
     except Exception as e:
@@ -106,6 +114,8 @@ def reset_state():
         'cameraInstance': None,
         'ledArray': LargeLEDArray(),
         'last_heartbeat': time.time(),
+        'frame_buffer': [],  # Buffer to store captured frames
+        'buffering_active': False,  # Flag to indicate if buffering is active
     }
 
 def startCamera(V_res, H_res):
@@ -268,6 +278,133 @@ async def handle_reset(command, websocket, state):
         except:
             pass
 
+async def handle_start_buffering(command, websocket, state):
+    """Start buffering frames in memory"""
+    try:
+        state['frame_buffer'] = []
+        state['buffering_active'] = True
+        result = {'result': 'success', 'message': 'Frame buffering started'}
+        await websocket.send(json.dumps(result))
+        logger.info("Frame buffering started")
+    except Exception as e:
+        logger.error(f"Error starting frame buffering: {e}")
+        result = {'result': 'error', 'message': str(e)}
+        try:
+            await websocket.send(json.dumps(result))
+        except:
+            pass
+
+async def handle_capture_buffered(command, websocket, state):
+    """Capture a frame and store it in the buffer"""
+    try:
+        if not state['buffering_active']:
+            result = {'result': 'error', 'message': 'Buffering not active'}
+            await websocket.send(json.dumps(result))
+            return
+            
+        if not state['cameraIsStarted']:
+            result = {'result': 'error', 'message': 'Camera not started'}
+            await websocket.send(json.dumps(result))
+            return
+        
+        # Capture frame and add to buffer
+        result_array = captureFrame(camera=state['cameraInstance'])
+        frame = np.array(result_array[0])
+        state['frame_buffer'].append(frame)
+        
+        result = {'result': 'success', 'frame_count': len(state['frame_buffer'])}
+        await websocket.send(json.dumps(result))
+        logger.debug(f"Buffered frame captured, total frames: {len(state['frame_buffer'])}")
+        
+    except Exception as e:
+        logger.error(f"Error capturing buffered frame: {e}")
+        result = {'result': 'error', 'message': str(e)}
+        try:
+            await websocket.send(json.dumps(result))
+        except:
+            pass
+
+async def handle_transfer_all_frames(command, websocket, state):
+    """Transfer all buffered frames to the master"""
+    try:
+        if not state['buffering_active']:
+            result = {'result': 'error', 'message': 'Buffering not active'}
+            await websocket.send(json.dumps(result))
+            return
+        
+        frame_count = len(state['frame_buffer'])
+        logger.info(f"Transferring {frame_count} buffered frames")
+        
+        # Send frame count first
+        frame_count_msg = {'frame_count': frame_count}
+        await websocket.send(json.dumps(frame_count_msg))
+        await websocket.recv()  # Wait for acknowledgment
+        
+        # Send each frame
+        for i, frame in enumerate(state['frame_buffer']):
+            logger.info(f"Sending buffered frame {i+1}/{frame_count}")
+            
+            # Serialize frame
+            buffer = io.BytesIO()
+            np.save(buffer, frame)
+            buffer.seek(0)
+            data = buffer.read()
+            
+            # Send frame data in chunks
+            for j in range(0, len(data), FRAGMENT_SIZE):
+                chunk = data[j:j + FRAGMENT_SIZE]
+                await websocket.send(chunk)
+                await websocket.recv()  # Wait for acknowledgment
+            
+            # Send frame end marker
+            await websocket.send(b"FRAME_END")
+        
+        logger.info(f"Successfully transferred {frame_count} buffered frames")
+        
+    except ConnectionClosed:
+        logger.warning("Connection closed during frame transfer")
+        raise
+    except Exception as e:
+        logger.error(f"Error transferring buffered frames: {e}")
+
+async def handle_stop_buffering(command, websocket, state):
+    """Stop buffering frames and optionally clear buffer"""
+    try:
+        state['buffering_active'] = False
+        frame_count = len(state['frame_buffer'])
+        
+        # Keep frames in buffer for potential transfer
+        result = {'result': 'success', 'message': f'Frame buffering stopped, {frame_count} frames in buffer'}
+        await websocket.send(json.dumps(result))
+        logger.info(f"Frame buffering stopped, {frame_count} frames in buffer")
+        
+    except Exception as e:
+        logger.error(f"Error stopping frame buffering: {e}")
+        result = {'result': 'error', 'message': str(e)}
+        try:
+            await websocket.send(json.dumps(result))
+        except:
+            pass
+
+async def handle_clear_buffer(command, websocket, state):
+    """Clear the frame buffer"""
+    try:
+        frame_count = len(state['frame_buffer'])
+        state['frame_buffer'] = []
+        state['buffering_active'] = False
+        
+        result = {'result': 'success', 'message': f'Frame buffer cleared, {frame_count} frames removed'}
+        await websocket.send(json.dumps(result))
+        logger.info(f"Frame buffer cleared, {frame_count} frames removed")
+        
+    except Exception as e:
+        logger.error(f"Error clearing frame buffer: {e}")
+        result = {'result': 'error', 'message': str(e)}
+        try:
+            await websocket.send(json.dumps(result))
+        except:
+            pass
+
 ACTION_HANDLERS = {
     'start_camera': handle_start_camera,
     'capture': handle_capture,
@@ -277,6 +414,11 @@ ACTION_HANDLERS = {
     'SET_LED_COLOR': handle_set_led_color,
     'ping': handle_ping,
     'reset': handle_reset,
+    'start_buffering': handle_start_buffering,
+    'capture_buffered': handle_capture_buffered,
+    'transfer_all_frames': handle_transfer_all_frames,
+    'stop_buffering': handle_stop_buffering,
+    'clear_buffer': handle_clear_buffer,
 }
 
 async def handler(websocket, path):
