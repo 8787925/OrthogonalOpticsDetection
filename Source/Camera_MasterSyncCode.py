@@ -14,6 +14,8 @@ from matplotlib import pyplot as plt
 import pickle
 import logging
 from websockets.exceptions import ConnectionClosed, WebSocketException
+from collections import namedtuple
+from typing import Optional
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
@@ -48,6 +50,13 @@ MAX_RETRY_ATTEMPTS = 5
 INITIAL_RETRY_DELAY = 1.0  # seconds
 MAX_RETRY_DELAY = 30.0  # seconds
 CONNECTION_TIMEOUT = 30  # seconds
+
+# Frame buffer for decoupling capture from transfer
+FrameData = namedtuple('FrameData', ['frame_id', 'data', 'timestamp'])
+frame_buffer_queue = asyncio.Queue(maxsize=30)  # Buffer up to 30 frames
+frame_receiver_task = None
+frame_id_counter = 0
+pending_frame_ids = set()  # Track frames we're waiting for
 HEARTBEAT_INTERVAL = 10  # seconds
 
 #sensitivity accumulation 
@@ -127,6 +136,131 @@ async def send_command_with_retry(websocket, command, max_attempts=3):
                 raise
     return False
 
+async def continuous_frame_receiver(websocket):
+    """Background task that continuously receives frames and buffers them"""
+    logger.info("Starting continuous frame receiver")
+    
+    try:
+        while True:
+            # Wait for frame data to arrive
+            full_data = bytearray()
+            frame_id = None
+            
+            # First message should be frame metadata
+            try:
+                metadata_msg = await websocket.recv()
+                if isinstance(metadata_msg, str):
+                    metadata = json.loads(metadata_msg)
+                    frame_id = metadata.get('frame_id')
+                    await websocket.send("OK")
+                else:
+                    # If it's binary data, it might be the old protocol
+                    logger.warning("Received unexpected binary data as first message")
+                    continue
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse frame metadata")
+                continue
+            
+            # Now receive the actual frame data
+            while True:
+                chunk = await websocket.recv()
+                if chunk == b"END":
+                    break
+                full_data.extend(chunk)
+                await websocket.send("OK")
+            
+            # Deserialize the frame data
+            buffer = io.BytesIO(full_data)
+            buffer.seek(0)
+            frame_data = np.load(buffer)
+            frame_data = np.fliplr(frame_data)
+            
+            # Create frame object with metadata
+            frame_obj = FrameData(
+                frame_id=frame_id,
+                data=frame_data,
+                timestamp=time.time()
+            )
+            
+            # Add to buffer queue (non-blocking to avoid deadlock)
+            try:
+                frame_buffer_queue.put_nowait(frame_obj)
+                logger.debug(f"Buffered frame {frame_id}")
+                
+                # Remove from pending set if it was there
+                if frame_id in pending_frame_ids:
+                    pending_frame_ids.discard(frame_id)
+                    
+            except asyncio.QueueFull:
+                logger.warning("Frame buffer queue is full, dropping oldest frame")
+                try:
+                    # Drop oldest frame to make room
+                    frame_buffer_queue.get_nowait()
+                    frame_buffer_queue.put_nowait(frame_obj)
+                except asyncio.QueueEmpty:
+                    pass
+                    
+    except ConnectionClosed:
+        logger.info("Frame receiver stopped - connection closed")
+    except Exception as e:
+        logger.error(f"Error in continuous frame receiver: {e}")
+    finally:
+        logger.info("Continuous frame receiver task ended")
+
+async def start_frame_receiver(websocket):
+    """Start the background frame receiver task"""
+    global frame_receiver_task
+    
+    if frame_receiver_task is None or frame_receiver_task.done():
+        frame_receiver_task = asyncio.create_task(continuous_frame_receiver(websocket))
+        logger.info("Started frame receiver task")
+    
+    return frame_receiver_task
+
+async def stop_frame_receiver():
+    """Stop the background frame receiver task"""
+    global frame_receiver_task
+    
+    if frame_receiver_task and not frame_receiver_task.done():
+        frame_receiver_task.cancel()
+        try:
+            await frame_receiver_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Stopped frame receiver task")
+    
+    frame_receiver_task = None
+
+async def clear_frame_buffer():
+    """Clear all frames from the buffer queue"""
+    cleared_count = 0
+    try:
+        while True:
+            frame_buffer_queue.get_nowait()
+            cleared_count += 1
+    except asyncio.QueueEmpty:
+        pass
+    
+    if cleared_count > 0:
+        logger.info(f"Cleared {cleared_count} frames from buffer")
+    
+    # Also clear pending frame IDs
+    pending_frame_ids.clear()
+
+async def get_buffer_status():
+    """Get current buffer status for debugging"""
+    buffer_size = frame_buffer_queue.qsize()
+    pending_count = len(pending_frame_ids)
+    
+    status = {
+        'buffer_size': buffer_size,
+        'pending_frames': pending_count,
+        'pending_ids': list(pending_frame_ids)
+    }
+    
+    logger.debug(f"Buffer status: {status}")
+    return status
+
 async def reset_remote_slave(websocket):
     """Send reset command to slave to clean up its resources"""
     try:
@@ -171,6 +305,74 @@ async def send_command_and_receive_data(websocket, command):
         logger.error(f"Error in send_command_and_receive_data: {e}")
         raise
 
+async def trigger_remote_capture(websocket, frame_id):
+    """Send capture trigger command with frame ID and return immediately"""
+    global pending_frame_ids
+    
+    try:
+        command = {'action': 'capture_buffered', 'frame_id': frame_id}
+        await send_command_with_retry(websocket, command)
+        
+        # Wait for acknowledgment that capture was triggered
+        response = await websocket.recv()
+        result = json.loads(response)
+        
+        if result.get('status') == 'capture_triggered':
+            pending_frame_ids.add(frame_id)
+            logger.debug(f"Capture triggered for frame {frame_id}")
+            return True
+        else:
+            logger.warning(f"Capture trigger failed: {result.get('message', 'Unknown error')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error triggering remote capture: {e}")
+        raise
+
+async def get_frame_from_buffer(frame_id, timeout=10.0):
+    """Retrieve a specific frame from the buffer queue"""
+    start_time = time.time()
+    
+    # First check if frame is already in buffer
+    temp_frames = []
+    
+    while time.time() - start_time < timeout:
+        try:
+            # Get frame from buffer with short timeout
+            frame_obj = await asyncio.wait_for(frame_buffer_queue.get(), timeout=0.1)
+            
+            if frame_obj.frame_id == frame_id:
+                # Found our frame! Put back any others we took out
+                for temp_frame in temp_frames:
+                    await frame_buffer_queue.put(temp_frame)
+                return frame_obj.data
+            else:
+                # Not our frame, keep it for later
+                temp_frames.append(frame_obj)
+                
+        except asyncio.TimeoutError:
+            # No frame available right now, continue waiting
+            continue
+    
+    # Timeout reached, put back all frames we took out
+    for temp_frame in temp_frames:
+        await frame_buffer_queue.put(temp_frame)
+    
+    # Remove from pending set since we failed to get it
+    pending_frame_ids.discard(frame_id)
+    
+    raise TimeoutError(f"Frame {frame_id} not received within {timeout} seconds")
+
+async def capture_with_buffer(websocket, frame_id):
+    """Trigger capture and retrieve frame using buffer system"""
+    # Trigger the capture
+    success = await trigger_remote_capture(websocket, frame_id)
+    if not success:
+        raise RuntimeError(f"Failed to trigger capture for frame {frame_id}")
+    
+    # Retrieve the frame from buffer
+    return await get_frame_from_buffer(frame_id)
+
 async def start_remote_camera(websocket):
     """Start the remote camera and return success status with retry logic"""
     try:
@@ -189,8 +391,8 @@ async def start_remote_camera(websocket):
         return False
 
 async def perform_calibration_routine(websocket):
-    """Perform homography calibration between local and remote cameras"""
-    global CALIBRATION_NEEDED, HomographyMatrix
+    """Perform homography calibration between local and remote cameras using buffered capture"""
+    global CALIBRATION_NEEDED, HomographyMatrix, frame_id_counter
     
     if not CALIBRATION_NEEDED:
         return True
@@ -199,17 +401,36 @@ async def perform_calibration_routine(websocket):
     local_frames = []
     remote_frames = []
     
-    for i in range(NUMBER_OF_CALIBRATION_FRAMES):
-        local_frame = localCamera.capture_array()
-        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+    try:
+        # Start the frame receiver task
+        await clear_frame_buffer()  # Clear any stale frames
+        await start_frame_receiver(websocket)
         
-        print(f"Frame {i} of {NUMBER_OF_CALIBRATION_FRAMES} captured")
-        cv2.imwrite(f'remoteCalImg{i}.jpg', remote_frame)
-        cv2.imwrite(f'localCalImg{i}.jpg', local_frame)
-        
-        if i >= FIRST_CALIBRATION_FRAME:
-            local_frames.append(local_frame)
-            remote_frames.append(remote_frame)
+        for i in range(NUMBER_OF_CALIBRATION_FRAMES):
+            # Generate unique frame ID
+            frame_id = f"cal_frame_{frame_id_counter}_{i}"
+            frame_id_counter += 1
+            
+            # Capture frames
+            local_frame = localCamera.capture_array()
+            
+            try:
+                remote_frame = await capture_with_buffer(websocket, frame_id)
+            except (TimeoutError, RuntimeError) as e:
+                logger.warning(f"Buffered capture failed for calibration frame {i}, using direct method: {e}")
+                remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+            
+            print(f"Frame {i} of {NUMBER_OF_CALIBRATION_FRAMES} captured")
+            cv2.imwrite(f'remoteCalImg{i}.jpg', remote_frame)
+            cv2.imwrite(f'localCalImg{i}.jpg', local_frame)
+            
+            if i >= FIRST_CALIBRATION_FRAME:
+                local_frames.append(local_frame)
+                remote_frames.append(remote_frame)
+    
+    finally:
+        # Stop frame receiver
+        await stop_frame_receiver()
     
     await websocket.send(json.dumps({'action': 'CAMERA_OFF'}))
     print("Calculating Homography")
@@ -256,10 +477,15 @@ async def perform_sensitivity_mapping(websocket):
     return True
 
 async def perform_detection_sequence(websocket):
-    """Main detection sequence with LED flashing and error handling"""
+    """Main detection sequence with LED flashing and error handling using buffered capture"""
+    global frame_id_counter
     logger.info("Starting detection sequence")
     
     try:
+        # Start the frame receiver task if not already running
+        await clear_frame_buffer()  # Clear any stale frames
+        await start_frame_receiver(websocket)
+        
         for i in range(NUMBER_OF_FRAMES):
             logger.info(f"Processing frame {i+1}/{NUMBER_OF_FRAMES}")
             
@@ -267,9 +493,21 @@ async def perform_detection_sequence(websocket):
             await send_command_with_retry(websocket, {'action': 'LED_ON'})
             time.sleep(0.5)
             
-            # Capture frames
+            # Generate unique frame ID
+            frame_id = f"frame_{frame_id_counter}_{i}"
+            frame_id_counter += 1
+            
+            # Capture local frame immediately
             local_frame = localCamera.capture_array()
-            remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+            
+            # Trigger remote capture (non-blocking) and get frame from buffer
+            try:
+                remote_frame = await capture_with_buffer(websocket, frame_id)
+            except (TimeoutError, RuntimeError) as e:
+                logger.error(f"Failed to capture remote frame {i}: {e}")
+                # Fallback to old method if buffered capture fails
+                logger.info("Falling back to direct capture method")
+                remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
             
             # Align and process images
             aligned_local = align_fromHomography(local_frame, HomographyMatrix)
@@ -293,6 +531,9 @@ async def perform_detection_sequence(websocket):
     except Exception as e:
         logger.error(f"Error in detection sequence: {e}")
         return False
+    finally:
+        # Stop the frame receiver when done
+        await stop_frame_receiver()
 
 async def client():
     """Main client function with robust connection handling"""
@@ -351,6 +592,9 @@ async def client():
     finally:
         # Clean up resources
         try:
+            # Stop frame receiver task
+            await stop_frame_receiver()
+            
             if localCamera:
                 localCamera.stop()
                 logger.info("Local camera stopped")

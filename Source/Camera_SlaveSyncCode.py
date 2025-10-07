@@ -195,6 +195,60 @@ async def handle_capture(command, websocket, state):
     except Exception as e:
         logger.error(f"Error during capture: {e}")
 
+async def handle_capture_buffered(command, websocket, state):
+    """Handle buffered capture with immediate acknowledgment and frame ID"""
+    try:
+        if not state['cameraIsStarted']:
+            logger.warning("Buffered capture requested but camera not started")
+            error_response = {'status': 'error', 'message': 'Camera not started'}
+            await websocket.send(json.dumps(error_response))
+            return
+        
+        # Extract frame ID from command
+        frame_id = command.get('frame_id', 'unknown')
+        
+        # Send immediate acknowledgment that capture is triggered
+        ack_response = {'status': 'capture_triggered', 'frame_id': frame_id}
+        await websocket.send(json.dumps(ack_response))
+        logger.debug(f"Capture triggered for frame {frame_id}")
+        
+        # Capture the frame
+        result_array = captureFrame(camera=state['cameraInstance'])
+        large_array = np.array(result_array[0])
+        
+        # Prepare the frame data
+        buffer = io.BytesIO()
+        np.save(buffer, large_array)
+        buffer.seek(0)
+        data = buffer.read()
+        
+        # Send frame metadata first
+        metadata = {'frame_id': frame_id, 'data_size': len(data)}
+        await websocket.send(json.dumps(metadata))
+        await websocket.recv()  # Wait for OK confirmation
+        
+        # Send the binary data in chunks
+        for i in range(0, len(data), FRAGMENT_SIZE):
+            chunk = data[i:i + FRAGMENT_SIZE]
+            await websocket.send(chunk)
+            await websocket.recv()  # Wait for OK confirmation
+        
+        # Send end marker
+        await websocket.send(b"END")
+        logger.info(f"Buffered frame {frame_id} captured and sent successfully")
+        
+    except ConnectionClosed:
+        logger.warning("Connection closed during buffered capture")
+        raise
+    except Exception as e:
+        logger.error(f"Error during buffered capture: {e}")
+        # Try to send error response if possible
+        try:
+            error_response = {'status': 'error', 'message': str(e), 'frame_id': command.get('frame_id', 'unknown')}
+            await websocket.send(json.dumps(error_response))
+        except:
+            pass
+
 async def handle_camera_off(command, websocket, state):
     try:
         if state.get('cameraInstance') and state['cameraIsStarted']:
@@ -271,6 +325,7 @@ async def handle_reset(command, websocket, state):
 ACTION_HANDLERS = {
     'start_camera': handle_start_camera,
     'capture': handle_capture,
+    'capture_buffered': handle_capture_buffered,
     'CAMERA_OFF': handle_camera_off,
     'LED_ON': handle_led_on,
     'LED_OFF': handle_led_off,
