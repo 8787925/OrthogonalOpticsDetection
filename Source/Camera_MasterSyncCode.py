@@ -30,7 +30,7 @@ WEBSOCKET_MASTER = 'camera0bee.lan'
 WEBSOCKET_SLAVE = 'beemonitor.lan'
 WEBSOCKET_PORT = 18873
 FRAGMENT_SIZE = 1 #indicies
-NUMBER_OF_FRAMES = 15
+NUMBER_OF_FRAMES = 30
 NUMBER_OF_CALIBRATION_FRAMES = 15
 FIRST_CALIBRATION_FRAME = 7
 HOMOGRAPHY_CALIBRATION_NAME = 'wallCalibration_image_1080.pickle'
@@ -323,13 +323,13 @@ async def perform_calibration_routine(websocket):
         print(f"Frame {i} of {NUMBER_OF_CALIBRATION_FRAMES} captured")
         local_frames.append(local_frame)
     
-    # Stop buffering and transfer all frames
+    # Transfer all buffered frames from slave (while buffering is still active)
+    remote_frames = await transfer_all_buffered_frames(websocket)
+    
+    # Now stop buffering
     if not await stop_frame_buffering(websocket):
         logger.error("Failed to stop frame buffering for calibration")
         return False
-    
-    # Transfer all buffered frames from slave
-    remote_frames = await transfer_all_buffered_frames(websocket)
     
     if len(remote_frames) != len(local_frames):
         logger.error(f"Calibration frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
@@ -389,13 +389,13 @@ async def perform_sensitivity_mapping(websocket):
             logger.error(f"Failed to capture buffered sensitivity frame {i}")
             return False
     
-    # Stop buffering and transfer all frames
+    # Transfer all buffered frames from slave (while buffering is still active)
+    remote_frames = await transfer_all_buffered_frames(websocket)
+    
+    # Now stop buffering
     if not await stop_frame_buffering(websocket):
         logger.error("Failed to stop frame buffering for sensitivity mapping")
         return False
-    
-    # Transfer all buffered frames from slave
-    remote_frames = await transfer_all_buffered_frames(websocket)
     
     if len(remote_frames) != len(local_frames):
         logger.error(f"Sensitivity frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
@@ -428,14 +428,14 @@ async def perform_detection_sequence(websocket):
         # Buffer to store local frames
         local_frames = []
         
+		# Turn on LED
+        await send_command_with_retry(websocket, {'action': 'LED_ON'})
+        time.sleep(0.5)		
+        
         # Capture all frames first (buffered)
         for i in range(NUMBER_OF_FRAMES):
             logger.info(f"Capturing frame {i+1}/{NUMBER_OF_FRAMES}")
-            
-            # Turn on LED
-            await send_command_with_retry(websocket, {'action': 'LED_ON'})
-            time.sleep(0.5)
-            
+
             # Capture local frame and store in buffer
             local_frame = localCamera.capture_array()
             local_frames.append(local_frame)
@@ -450,14 +450,14 @@ async def perform_detection_sequence(websocket):
         # Turn off LED after all captures
         await send_command_with_retry(websocket, {'action': 'LED_OFF'})
         
-        # Stop buffering on slave
+        # Transfer all buffered frames from slave (while buffering is still active)
+        logger.info("Transferring all buffered frames from slave")
+        remote_frames = await transfer_all_buffered_frames(websocket)
+        
+        # Now stop buffering on slave
         if not await stop_frame_buffering(websocket):
             logger.error("Failed to stop frame buffering")
             return False
-        
-        # Transfer all buffered frames from slave
-        logger.info("Transferring all buffered frames from slave")
-        remote_frames = await transfer_all_buffered_frames(websocket)
         
         if len(remote_frames) != len(local_frames):
             logger.error(f"Frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
