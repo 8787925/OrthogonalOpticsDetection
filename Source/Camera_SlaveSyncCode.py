@@ -116,9 +116,10 @@ def reset_state():
         'last_heartbeat': time.time(),
         'frame_buffer': [],  # Buffer to store captured frames
         'buffering_active': False,  # Flag to indicate if buffering is active
+        'camera_config': None,  # Store received camera configuration
     }
 
-def startCamera(V_res, H_res):
+def startCamera(V_res, H_res, camera_controls=None):
     global cameraIsStarted
     global cameraIsPrimed
     picam2a = Picamera2(0)
@@ -126,7 +127,15 @@ def startCamera(V_res, H_res):
         main={"size": (H_res,V_res)},
         queue = True)
     picam2a.configure(camera_configa)
-    picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
+    
+    # Apply camera controls (use provided controls or defaults)
+    if camera_controls:
+        logger.info(f"Applying received camera controls: {camera_controls}")
+        picam2a.set_controls(camera_controls)
+    else:
+        logger.info("Using default camera controls")
+        picam2a.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
+    
     picam2a.start(show_preview=False)
 
     #for i in range(3): 
@@ -151,6 +160,20 @@ def captureFrame(camera, captures = 1, DO_TIFF = False):
 async def handle_start_camera(command, websocket, state):
     try:
         if not state['cameraIsStarted']:
+            # Extract configuration parameters
+            if state.get('camera_config'):
+                config = state['camera_config']
+                v_res = config['resolution']['height']
+                h_res = config['resolution']['width']
+                controls = config['controls']
+                logger.info(f"Using received camera configuration: {v_res}x{h_res}, controls: {controls}")
+            else:
+                # Use default configuration
+                v_res = CAMERA_V_RESOLUTION
+                h_res = CAMERA_H_RESOLUTION
+                controls = None
+                logger.info("Using default camera configuration")
+            
             # If camera exists but is not started, check if it's properly configured
             if state.get('cameraInstance') and state['cameraIsPrimed']:
                 try:
@@ -161,12 +184,12 @@ async def handle_start_camera(command, websocket, state):
                     logger.warning(f"Failed to restart existing camera: {e}. Creating new camera.")
                     # Clean up the old camera and create a new one
                     closeCamera(state['cameraInstance'])
-                    state['cameraInstance'] = startCamera(CAMERA_V_RESOLUTION, CAMERA_H_RESOLUTION)
+                    state['cameraInstance'] = startCamera(v_res, h_res, controls)
                     state['cameraIsPrimed'] = True
                     state['cameraIsStarted'] = True
             else:
-                # Create a new camera instance
-                state['cameraInstance'] = startCamera(CAMERA_V_RESOLUTION, CAMERA_H_RESOLUTION)
+                # Create a new camera instance with received configuration
+                state['cameraInstance'] = startCamera(v_res, h_res, controls)
                 state['cameraIsPrimed'] = True
                 state['cameraIsStarted'] = True
 
@@ -405,6 +428,67 @@ async def handle_clear_buffer(command, websocket, state):
         except:
             pass
 
+async def handle_set_camera_config(command, websocket, state):
+    """Receive and store camera configuration from master"""
+    try:
+        if 'config' not in command:
+            result = {'result': 'error', 'message': 'No camera configuration provided'}
+            await websocket.send(json.dumps(result))
+            return
+        
+        # Store the camera configuration
+        state['camera_config'] = command['config']
+        
+        logger.info(f"Received camera configuration: {state['camera_config']}")
+        
+        # If camera is currently running, we might need to restart it with new config
+        # For now, just store the config for the next camera start
+        
+        result = {'result': 'success', 'message': 'Camera configuration received and stored'}
+        await websocket.send(json.dumps(result))
+        logger.info("Camera configuration received and stored successfully")
+        
+    except Exception as e:
+        logger.error(f"Error setting camera configuration: {e}")
+        result = {'result': 'error', 'message': str(e)}
+        try:
+            await websocket.send(json.dumps(result))
+        except:
+            pass
+
+async def handle_update_camera_controls(command, websocket, state):
+    """Update camera controls during operation"""
+    try:
+        if 'controls' not in command:
+            result = {'result': 'error', 'message': 'No camera controls provided'}
+            await websocket.send(json.dumps(result))
+            return
+        
+        if not state.get('cameraInstance') or not state['cameraIsStarted']:
+            result = {'result': 'error', 'message': 'Camera not started'}
+            await websocket.send(json.dumps(result))
+            return
+        
+        # Apply the controls to the running camera
+        controls = command['controls']
+        state['cameraInstance'].set_controls(controls)
+        
+        # Update stored configuration if it exists
+        if state.get('camera_config'):
+            state['camera_config']['controls'].update(controls)
+        
+        result = {'result': 'success', 'message': f'Camera controls updated: {controls}'}
+        await websocket.send(json.dumps(result))
+        logger.info(f"Camera controls updated: {controls}")
+        
+    except Exception as e:
+        logger.error(f"Error updating camera controls: {e}")
+        result = {'result': 'error', 'message': str(e)}
+        try:
+            await websocket.send(json.dumps(result))
+        except:
+            pass
+
 ACTION_HANDLERS = {
     'start_camera': handle_start_camera,
     'capture': handle_capture,
@@ -419,6 +503,8 @@ ACTION_HANDLERS = {
     'transfer_all_frames': handle_transfer_all_frames,
     'stop_buffering': handle_stop_buffering,
     'clear_buffer': handle_clear_buffer,
+    'set_camera_config': handle_set_camera_config,
+    'update_camera_controls': handle_update_camera_controls,
 }
 
 async def handler(websocket, path):

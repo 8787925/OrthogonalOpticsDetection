@@ -275,9 +275,74 @@ async def clear_slave_buffer(websocket):
         logger.error(f"Error clearing slave buffer: {e}")
         return False
 
-async def start_remote_camera(websocket):
-    """Start the remote camera and return success status with retry logic"""
+async def send_camera_configuration(websocket):
+    """Send camera configuration to slave"""
     try:
+        # Extract current camera configuration
+        camera_config = {
+            'resolution': {
+                'width': CAMERA_H_RESOLUTION,
+                'height': CAMERA_V_RESOLUTION
+            },
+            'controls': {
+                'ExposureTime': 10000,
+                'AnalogueGain': 5
+            },
+            'queue': False
+        }
+        
+        command = {
+            'action': 'set_camera_config',
+            'config': camera_config
+        }
+        
+        await send_command_with_retry(websocket, command)
+        response = await websocket.recv()
+        result = json.loads(response)
+        
+        if result.get('result') == 'success':
+            logger.info("Camera configuration sent to slave successfully")
+            return True
+        else:
+            logger.error(f"Failed to send camera configuration: {result.get('message', 'Unknown error')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error sending camera configuration: {e}")
+        return False
+
+async def update_camera_controls(websocket, controls):
+    """Update camera controls on slave during operation"""
+    try:
+        command = {
+            'action': 'update_camera_controls',
+            'controls': controls
+        }
+        
+        await send_command_with_retry(websocket, command)
+        response = await websocket.recv()
+        result = json.loads(response)
+        
+        if result.get('result') == 'success':
+            logger.info(f"Camera controls updated on slave: {controls}")
+            return True
+        else:
+            logger.error(f"Failed to update camera controls: {result.get('message', 'Unknown error')}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error updating camera controls: {e}")
+        return False
+
+async def start_remote_camera(websocket):
+    """Start the remote camera with synchronized configuration"""
+    try:
+        # First send camera configuration to ensure identical settings
+        if not await send_camera_configuration(websocket):
+            logger.error("Failed to send camera configuration to slave")
+            return False
+        
+        # Then start the camera
         command = {'action': 'start_camera'}
         await send_command_with_retry(websocket, command)
         start_result = await websocket.recv()
