@@ -273,13 +273,12 @@ async def perform_detection_sequence(websocket):
             
             # Align and process images
             aligned_local = align_fromHomography(local_frame, HomographyMatrix)
-            
-            cv2.imwrite(f'testImage{i}.jpg', remote_frame)
-            cv2.imwrite(f'localImageTest{i}.jpg', aligned_local)
-            
+            cv2.imwrite(f'RemoteImage{i}.jpg', remote_frame)
+            cv2.imwrite(f'LocalImageTest{i}.jpg', aligned_local)
+
             # Perform difference detection
             difference_image = performDifferenceIdentity(aligned_local, remote_frame)
-            cv2.imwrite(f'differenceImage{i}.jpg', difference_image)
+            cv2.imwrite(f'DifferenceImage{i}.jpg', difference_image)
             
             logger.info(f"Processed frame {i+1}/{NUMBER_OF_FRAMES}, shape: {remote_frame.shape}")
         
