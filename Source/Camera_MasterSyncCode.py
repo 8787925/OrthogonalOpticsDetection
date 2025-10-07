@@ -30,7 +30,7 @@ WEBSOCKET_MASTER = 'camera0bee.lan'
 WEBSOCKET_SLAVE = 'beemonitor.lan'
 WEBSOCKET_PORT = 18873
 FRAGMENT_SIZE = 1 #indicies
-NUMBER_OF_FRAMES = 30
+NUMBER_OF_FRAMES = 10
 NUMBER_OF_CALIBRATION_FRAMES = 15
 FIRST_CALIBRATION_FRAME = 7
 HOMOGRAPHY_CALIBRATION_NAME = 'wallCalibration_image_1080.pickle'
@@ -40,8 +40,86 @@ calibrationFramesAccumulated = 0
 rawCalibrationImageSet_1 = []
 rawCalibrationImageSet_2 = []
 NUMBER_OF_CAMERAS = 2
-CAMERA_H_RESOLUTION = 1920
-CAMERA_V_RESOLUTION = 1080
+
+# Standard camera resolutions dictionary
+STANDARD_RESOLUTIONS = {
+    '480p': (640, 480),
+    '720p': (1280, 720),
+    '1080p': (1920, 1080),
+    '1440p': (2560, 1440),
+    '4K': (3840, 2160),
+    '8K': (7680, 4320),
+    'VGA': (640, 480),
+    'SVGA': (800, 600),
+    'XGA': (1024, 768),
+    'SXGA': (1280, 1024),
+    'UXGA': (1600, 1200),
+    'QVGA': (320, 240),
+    'HVGA': (480, 320),
+    'nHD': (640, 360),
+    'qHD': (960, 540),
+    'WVGA': (800, 480),
+    'FWVGA': (854, 480),
+    'WSVGA': (1024, 600),
+    'WXGA': (1366, 768)
+}
+
+# Current camera resolution setting
+CAMERA_RESOLUTION = '1080p'  # Change this to use different resolutions
+
+def get_camera_resolution(resolution_name):
+    """
+    Translate resolution name to (horizontal, vertical) tuple
+    
+    Args:
+        resolution_name (str): Name of the resolution (e.g., '1080p', '720p', '4K')
+    
+    Returns:
+        tuple: (horizontal_resolution, vertical_resolution)
+    
+    Raises:
+        ValueError: If resolution name is not found in STANDARD_RESOLUTIONS
+    """
+    if resolution_name not in STANDARD_RESOLUTIONS:
+        available_resolutions = ', '.join(STANDARD_RESOLUTIONS.keys())
+        raise ValueError(f"Resolution '{resolution_name}' not found. Available resolutions: {available_resolutions}")
+    
+    return STANDARD_RESOLUTIONS[resolution_name]
+
+# Get current camera resolution
+CAMERA_H_RESOLUTION, CAMERA_V_RESOLUTION = get_camera_resolution(CAMERA_RESOLUTION)
+
+def set_camera_resolution(resolution_name):
+    """
+    Set a new camera resolution and update the global variables
+    
+    Args:
+        resolution_name (str): Name of the resolution (e.g., '1080p', '720p', '4K')
+    
+    Returns:
+        tuple: (horizontal_resolution, vertical_resolution)
+    
+    Raises:
+        ValueError: If resolution name is not found in STANDARD_RESOLUTIONS
+    """
+    global CAMERA_RESOLUTION, CAMERA_H_RESOLUTION, CAMERA_V_RESOLUTION
+    
+    h_res, v_res = get_camera_resolution(resolution_name)
+    CAMERA_RESOLUTION = resolution_name
+    CAMERA_H_RESOLUTION = h_res
+    CAMERA_V_RESOLUTION = v_res
+    
+    logger.info(f"Camera resolution set to {resolution_name}: {h_res}x{v_res}")
+    return h_res, v_res
+
+def list_available_resolutions():
+    """
+    Return a list of all available resolution names
+    
+    Returns:
+        list: List of available resolution names
+    """
+    return list(STANDARD_RESOLUTIONS.keys())
 
 # Connection settings
 MAX_RETRY_ATTEMPTS = 5
@@ -282,7 +360,8 @@ async def send_camera_configuration(websocket):
         camera_config = {
             'resolution': {
                 'width': CAMERA_H_RESOLUTION,
-                'height': CAMERA_V_RESOLUTION
+                'height': CAMERA_V_RESOLUTION,
+                'name': CAMERA_RESOLUTION  # Include resolution name for reference
             },
             'controls': {
                 'ExposureTime': 10000,
@@ -301,7 +380,7 @@ async def send_camera_configuration(websocket):
         result = json.loads(response)
         
         if result.get('result') == 'success':
-            logger.info("Camera configuration sent to slave successfully")
+            logger.info(f"Camera configuration sent to slave successfully ({CAMERA_RESOLUTION}: {CAMERA_H_RESOLUTION}x{CAMERA_V_RESOLUTION})")
             return True
         else:
             logger.error(f"Failed to send camera configuration: {result.get('message', 'Unknown error')}")
