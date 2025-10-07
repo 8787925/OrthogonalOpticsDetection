@@ -12,12 +12,18 @@ from alignImages import *
 import os
 from matplotlib import pyplot as plt
 import pickle
+import logging
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
 #First it sends a 'startup' command, to the 'Sink' computer, and awaits signal that the camera is ready
 #
 #This code is technically the 'client' code of a websocket arrangement
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Name of master computer
 WEBSOCKET_MASTER = 'camera0bee.lan'
@@ -36,6 +42,13 @@ rawCalibrationImageSet_2 = []
 NUMBER_OF_CAMERAS = 2
 CAMERA_H_RESOLUTION = 1920
 CAMERA_V_RESOLUTION = 1080
+
+# Connection settings
+MAX_RETRY_ATTEMPTS = 5
+INITIAL_RETRY_DELAY = 1.0  # seconds
+MAX_RETRY_DELAY = 30.0  # seconds
+CONNECTION_TIMEOUT = 30  # seconds
+HEARTBEAT_INTERVAL = 10  # seconds
 
 #sensitivity accumulation 
 sensitivityMapNeeded = True
@@ -65,31 +78,115 @@ camera_configa = localCamera.create_still_configuration(
 localCamera.configure(camera_configa)
 localCamera.set_controls({"ExposureTime": 10000, "AnalogueGain": 5})
 
+async def connect_with_retry(max_attempts=MAX_RETRY_ATTEMPTS):
+    """Establish WebSocket connection with exponential backoff retry"""
+    attempt = 0
+    delay = INITIAL_RETRY_DELAY
+    
+    while attempt < max_attempts:
+        try:
+            logger.info(f"Attempting to connect to ws://{WEBSOCKET_SLAVE}:{WEBSOCKET_PORT} (attempt {attempt + 1}/{max_attempts})")
+            websocket = await websockets.connect(
+                f"ws://{WEBSOCKET_SLAVE}:{WEBSOCKET_PORT}",
+                ping_interval=HEARTBEAT_INTERVAL,
+                ping_timeout=CONNECTION_TIMEOUT,
+                close_timeout=10
+            )
+            logger.info("Successfully connected to slave")
+            return websocket
+            
+        except Exception as e:
+            attempt += 1
+            if attempt < max_attempts:
+                logger.warning(f"Connection failed: {e}. Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, MAX_RETRY_DELAY)  # Exponential backoff with cap
+            else:
+                logger.error(f"Failed to connect after {max_attempts} attempts")
+                raise
+    
+    return None
+
+async def send_command_with_retry(websocket, command, max_attempts=3):
+    """Send command with retry logic"""
+    for attempt in range(max_attempts):
+        try:
+            await websocket.send(json.dumps(command))
+            return True
+        except ConnectionClosed:
+            logger.warning(f"Connection closed while sending command (attempt {attempt + 1})")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(1)
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"Error sending command: {e}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(1)
+            else:
+                raise
+    return False
+
+async def reset_remote_slave(websocket):
+    """Send reset command to slave to clean up its resources"""
+    try:
+        logger.info("Sending reset command to slave")
+        reset_command = {'action': 'reset'}
+        await send_command_with_retry(websocket, reset_command)
+        response = await websocket.recv()
+        result = json.loads(response)
+        if result.get('result') == 'success':
+            logger.info("Slave reset successful")
+            return True
+        else:
+            logger.warning(f"Slave reset failed: {result.get('message', 'Unknown error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error resetting slave: {e}")
+        return False
+
 async def send_command_and_receive_data(websocket, command):
-    """Send a command and receive binary data response"""
-    await websocket.send(json.dumps(command))
-    
-    full_data = bytearray()
-    while True:
-        chunk = await websocket.recv()
-        if chunk == b"END":
-            break
-        full_data.extend(chunk)
-        await websocket.send("Ok")
-    
-    # Deserialize the binary data back into a NumPy array
-    buffer = io.BytesIO(full_data)
-    buffer.seek(0)
-    remote_frame = np.load(buffer)
-    return np.fliplr(remote_frame)
+    """Send a command and receive binary data response with error handling"""
+    try:
+        await send_command_with_retry(websocket, command)
+        
+        full_data = bytearray()
+        while True:
+            chunk = await websocket.recv()
+            if chunk == b"END":
+                break
+            full_data.extend(chunk)
+            await websocket.send("Ok")
+        
+        # Deserialize the binary data back into a NumPy array
+        buffer = io.BytesIO(full_data)
+        buffer.seek(0)
+        remote_frame = np.load(buffer)
+        return np.fliplr(remote_frame)
+        
+    except ConnectionClosed:
+        logger.error("Connection closed during data transfer")
+        raise
+    except Exception as e:
+        logger.error(f"Error in send_command_and_receive_data: {e}")
+        raise
 
 async def start_remote_camera(websocket):
-    """Start the remote camera and return success status"""
-    command = {'action': 'start_camera'}
-    await websocket.send(json.dumps(command))
-    start_result = await websocket.recv()
-    start_result = json.loads(start_result)
-    return start_result['result'] == 'success'
+    """Start the remote camera and return success status with retry logic"""
+    try:
+        command = {'action': 'start_camera'}
+        await send_command_with_retry(websocket, command)
+        start_result = await websocket.recv()
+        start_result = json.loads(start_result)
+        success = start_result['result'] == 'success'
+        if success:
+            logger.info("Remote camera started successfully")
+        else:
+            logger.error("Failed to start remote camera")
+        return success
+    except Exception as e:
+        logger.error(f"Error starting remote camera: {e}")
+        return False
 
 async def perform_calibration_routine(websocket):
     """Perform homography calibration between local and remote cameras"""
@@ -159,67 +256,141 @@ async def perform_sensitivity_mapping(websocket):
     return True
 
 async def perform_detection_sequence(websocket):
-    """Main detection sequence with LED flashing"""
-    print("Starting detection sequence")
+    """Main detection sequence with LED flashing and error handling"""
+    logger.info("Starting detection sequence")
     
-    for i in range(NUMBER_OF_FRAMES):
-        # Turn on LED
-        await websocket.send(json.dumps({'action': 'LED_ON'}))
-        time.sleep(0.5)
+    try:
+        for i in range(NUMBER_OF_FRAMES):
+            logger.info(f"Processing frame {i+1}/{NUMBER_OF_FRAMES}")
+            
+            # Turn on LED
+            await send_command_with_retry(websocket, {'action': 'LED_ON'})
+            time.sleep(0.5)
+            
+            # Capture frames
+            local_frame = localCamera.capture_array()
+            remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+            
+            # Align and process images
+            aligned_local = align_fromHomography(local_frame, HomographyMatrix)
+            
+            cv2.imwrite(f'testImage{i}.jpg', remote_frame)
+            cv2.imwrite(f'localImageTest{i}.jpg', aligned_local)
+            
+            # Perform difference detection
+            difference_image = performDifferenceIdentity(aligned_local, remote_frame)
+            cv2.imwrite(f'differenceImage{i}.jpg', difference_image)
+            
+            logger.info(f"Processed frame {i+1}/{NUMBER_OF_FRAMES}, shape: {remote_frame.shape}")
         
-        # Capture frames
-        local_frame = localCamera.capture_array()
-        remote_frame = await send_command_and_receive_data(websocket, {'action': 'capture'})
+        # Turn off LED
+        await send_command_with_retry(websocket, {'action': 'LED_OFF'})
+        logger.info('Detection sequence completed successfully')
+        return True
         
-        # Align and process images
-        aligned_local = align_fromHomography(local_frame, HomographyMatrix)
-        
-        cv2.imwrite(f'testImage{i}.jpg', remote_frame)
-        cv2.imwrite(f'localImageTest{i}.jpg', aligned_local)
-        
-        # Perform difference detection
-        difference_image = performDifferenceIdentity(aligned_local, remote_frame)
-        cv2.imwrite(f'differenceImage{i}.jpg', difference_image)
-        
-        print(f"Processed frame {i+1}/{NUMBER_OF_FRAMES}, shape: {remote_frame.shape}")
-    
-    # Turn off LED
-    await websocket.send(json.dumps({'action': 'LED_OFF'}))
-    print('Detection sequence complete')
+    except ConnectionClosed:
+        logger.error("Connection lost during detection sequence")
+        return False
+    except Exception as e:
+        logger.error(f"Error in detection sequence: {e}")
+        return False
 
 async def client():
-    """Main client function with improved structure"""
+    """Main client function with robust connection handling"""
     global localCamera
     
-    async with websockets.connect(f"ws://{WEBSOCKET_SLAVE}:{WEBSOCKET_PORT}") as websocket:
+    websocket = None
+    try:
+        # Establish connection with retry
+        websocket = await connect_with_retry()
+        
+        # Reset slave state to ensure clean start
+        await reset_remote_slave(websocket)
+        
         # Start remote camera
         if not await start_remote_camera(websocket):
-            print("Failed to start remote camera")
-            return
+            logger.error("Failed to start remote camera")
+            return False
         
         # Start local camera
+        logger.info("Starting local camera")
         time.sleep(1)
         localCamera.start(show_preview=False)
         
         # Perform calibration if needed
         if CALIBRATION_NEEDED:
+            logger.info("Starting calibration routine")
             if not await perform_calibration_routine(websocket):
-                print("Calibration failed")
-                return
+                logger.error("Calibration failed")
+                return False
         
         # Perform sensitivity mapping if needed
         if sensitivityMapNeeded:
+            logger.info("Starting sensitivity mapping")
             if not await perform_sensitivity_mapping(websocket):
-                print("Sensitivity mapping failed")
-                return
+                logger.error("Sensitivity mapping failed")
+                return False
         
         # Restart remote camera for detection
         if not await start_remote_camera(websocket):
-            print("Failed to restart remote camera")
-            return
+            logger.error("Failed to restart remote camera for detection")
+            return False
         
         # Run main detection sequence
+        logger.info("Starting detection sequence")
         await perform_detection_sequence(websocket)
+        
+        logger.info("All operations completed successfully")
+        return True
+        
+    except ConnectionClosed:
+        logger.error("Connection lost during operation")
+        return False
+    except Exception as e:
+        logger.error(f"Error in client operation: {e}")
+        return False
+    finally:
+        # Clean up resources
+        try:
+            if localCamera:
+                localCamera.stop()
+                logger.info("Local camera stopped")
+        except Exception as e:
+            logger.error(f"Error stopping local camera: {e}")
+            
+        if websocket:
+            try:
+                # Send final LED off command
+                await websocket.send(json.dumps({'action': 'LED_OFF'}))
+                await websocket.close()
+                logger.info("WebSocket connection closed")
+            except Exception as e:
+                logger.error(f"Error closing websocket: {e}")
+
+async def client_with_retry():
+    """Client wrapper with automatic retry on failure"""
+    for attempt in range(MAX_RETRY_ATTEMPTS):
+        try:
+            logger.info(f"Starting client operation (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS})")
+            success = await client()
+            if success:
+                logger.info("Client operation completed successfully")
+                return True
+            else:
+                logger.warning(f"Client operation failed (attempt {attempt + 1})")
+                
+        except Exception as e:
+            logger.error(f"Client operation error (attempt {attempt + 1}): {e}")
+            
+        # Wait before retry (except on last attempt)
+        if attempt < MAX_RETRY_ATTEMPTS - 1:
+            delay = INITIAL_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+            delay = min(delay, MAX_RETRY_DELAY)  # Cap the delay
+            logger.info(f"Waiting {delay} seconds before retry...")
+            await asyncio.sleep(delay)
+    
+    logger.error("All retry attempts failed")
+    return False
 
 def performDifferenceIdentity(localFrame, remoteFrame): 
     #subtract the two images to create a difference image
@@ -318,4 +489,16 @@ def sensitivityMapRoutine(accumulate_frame, local_frames, remote_frames):
     print("Sensitivity mapping complete")
 
 if __name__ == "__main__":
-    asyncio.run(client())
+    try:
+        logger.info("Starting camera master sync application")
+        success = asyncio.run(client_with_retry())
+        if success:
+            logger.info("Application completed successfully")
+        else:
+            logger.error("Application failed")
+    except KeyboardInterrupt:
+        logger.info("Application terminated by user")
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+    finally:
+        logger.info("Application shutdown")
