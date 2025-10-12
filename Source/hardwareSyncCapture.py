@@ -35,7 +35,7 @@ class HardwareSyncDualCamera:
                  framerate: int = 30,
                  bitrate: int = 10000000,
                  buffer_size: int = 10,
-                 flip_camera1: bool = True,
+                 flip_camera0: bool = True,
                  enable_homography: bool = True,
                  homography_file: str = "wallCalibration_image_1080.pickle",
                  correct_camera1_to_camera0: bool = True,
@@ -55,7 +55,7 @@ class HardwareSyncDualCamera:
             framerate: Frames per second
             bitrate: Video bitrate for H.264 encoding
             buffer_size: Frame buffer size
-            flip_camera1: Flip camera 1 frames horizontally (left/right)
+            flip_camera0: Flip camera 0 frames horizontally (left/right)
             enable_homography: Enable homography correction
             homography_file: Homography matrix file
             correct_camera1_to_camera0: If True, correct camera 1 to match camera 0 (typical)
@@ -73,7 +73,7 @@ class HardwareSyncDualCamera:
         self.framerate = framerate
         self.bitrate = bitrate
         self.buffer_size = buffer_size
-        self.flip_camera1 = flip_camera1
+        self.flip_camera0 = flip_camera0
         self.enable_homography = enable_homography
         self.correct_camera1_to_camera0 = correct_camera1_to_camera0
         self.auto_calibrate = auto_calibrate
@@ -316,9 +316,9 @@ class HardwareSyncDualCamera:
                     client_cap.release()
                     return False
                 
-                # Apply horizontal flip to camera 1 if enabled (before calibration)
-                if self.flip_camera1:
-                    frame_client = cv2.flip(frame_client, 1)
+                # Apply horizontal flip to camera 0 if enabled (before calibration)
+                if self.flip_camera0:
+                    frame_server = cv2.flip(frame_server, 1)
                 
                 camera0_frames.append(frame_server)
                 camera1_frames.append(frame_client)
@@ -505,9 +505,9 @@ class HardwareSyncDualCamera:
                         self.logger.warning("Failed to read from one or both cameras")
                     break
                 
-                # Flip camera 1 (client) frame horizontally if requested
-                if self.flip_camera1:
-                    frame_client = cv2.flip(frame_client, 1)  # 1 = horizontal flip
+                # Flip camera 0 (server) frame horizontally if requested
+                if self.flip_camera0:
+                    frame_server = cv2.flip(frame_server, 1)  # 1 = horizontal flip
                 
                 # Apply homography correction to only one camera if enabled
                 if self.enable_homography and self.homography_loaded:
@@ -534,8 +534,8 @@ class HardwareSyncDualCamera:
                 timestamp = time.time() * 1000
                 corrected_camera = 1 if self.correct_camera1_to_camera0 else 0
                 frame_pair = {
-                    'frame0': frame_server,  # Server camera (camera 0)
-                    'frame1': frame_client,  # Client camera (camera 1) - flipped if enabled
+                    'frame0': frame_server,  # Server camera (camera 0) - flipped if enabled
+                    'frame1': frame_client,  # Client camera (camera 1)
                     'timestamp': timestamp,
                     'hardware_synced': True,
                     'homography_corrected': self.enable_homography and self.homography_loaded,
@@ -631,7 +631,7 @@ class HardwareSyncDualCamera:
             'homography_loaded': self.homography_loaded,
             'auto_calibrate_enabled': self.auto_calibrate,
             'calibration_needed': self.calibration_needed,
-            'flip_camera1_enabled': self.flip_camera1,
+            'flip_camera0_enabled': self.flip_camera0,
             'debug_mode': self.debug_mode,
             'debug_frames_captured': self.debug_frames_captured if self.debug_mode else None,
             'debug_frame_limit': self.debug_frame_limit if self.debug_mode else None
@@ -719,7 +719,7 @@ def main():
         height=1080,
         framerate=15,  # Start with lower framerate
         bitrate=8000000,  # 8 Mbps for 1080p
-        flip_camera1=True,  # Flip camera 1 frames horizontally
+        flip_camera0=True,  # Flip camera 0 frames horizontally
         enable_homography=True,  # Enable homography correction
         homography_file="wallCalibration_image_1080.pickle",
         correct_camera1_to_camera0=True,  # Correct camera 1 to match camera 0
@@ -772,8 +772,8 @@ def main():
             
             # Perform difference analysis on aligned frames
             analysis = frame_difference_analysis(
-                frame_pair['frame0'],  # Camera 0 (reference or corrected)
-                frame_pair['frame1']   # Camera 1 (corrected or reference) + flipped
+                frame_pair['frame0'],  # Camera 0 (reference or corrected) + flipped
+                frame_pair['frame1']   # Camera 1 (corrected or reference)
             )
             
             # Print results
@@ -818,7 +818,7 @@ def debug_mode_example():
         height=720,
         framerate=10,  # Lower framerate for testing
         bitrate=4000000,  # 4 Mbps for 720p
-        flip_camera1=True,
+        flip_camera0=True,
         enable_homography=True,
         homography_file="wallCalibration_image_720.pickle",
         correct_camera1_to_camera0=True,
