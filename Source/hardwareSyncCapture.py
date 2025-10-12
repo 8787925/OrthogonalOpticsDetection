@@ -41,7 +41,11 @@ class HardwareSyncDualCamera:
                  correct_camera1_to_camera0: bool = True,
                  auto_calibrate: bool = True,
                  calibration_frames: int = 15,
-                 calibration_first_frame: int = 1):
+                 calibration_first_frame: int = 1,
+                 debug_mode: bool = False,
+                 debug_frame_limit: int = 30,
+                 save_output: bool = False,
+                 output_directory: str = "captured_frames"):
         """
         Initialize hardware synchronized capture
         
@@ -59,6 +63,10 @@ class HardwareSyncDualCamera:
             auto_calibrate: If True, automatically calibrate homography if file not found
             calibration_frames: Number of frames to capture for auto-calibration
             calibration_first_frame: Index of first frame to use for calibration calculation
+            debug_mode: If True, limit capture to a specific number of frames for testing
+            debug_frame_limit: Number of frames to capture in debug mode (default 30)
+            save_output: If True, save captured frames to disk
+            output_directory: Directory to save captured frames (default: "captured_frames")
         """
         self.width = width
         self.height = height
@@ -72,6 +80,22 @@ class HardwareSyncDualCamera:
         self.calibration_frames = calibration_frames
         self.calibration_first_frame = calibration_first_frame
         self.homography_file = homography_file
+        self.debug_mode = debug_mode
+        self.debug_frame_limit = debug_frame_limit
+        self.save_output = save_output
+        self.output_directory = output_directory
+        
+        # Setup logging early - needed for all subsequent operations
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
+        
+        # Create output directory if saving is enabled
+        if self.save_output:
+            os.makedirs(self.output_directory, exist_ok=True)
+            self.logger.info(f"Output directory created: {self.output_directory}")
+        
+        # Debug mode tracking
+        self.debug_frames_captured = 0
         
         # Homography support
         self.homography_matrix: Optional[np.ndarray] = None
@@ -116,10 +140,6 @@ class HardwareSyncDualCamera:
             'homography_corrections': 0,
             'homography_failures': 0
         }
-        
-        # Setup logging
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger(__name__)
         
         # Register cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -211,6 +231,51 @@ class HardwareSyncDualCamera:
             self.logger.error(f"❌ Error applying homography: {e}")
             return frame
     
+    def _save_frame_pair(self, frame_pair: dict, frame_number: int):
+        """
+        Save synchronized frame pair to disk
+        
+        Args:
+            frame_pair: Dictionary containing frame data
+            frame_number: Current frame number for naming
+        """
+        try:
+            # Generate timestamp for unique filenames
+            timestamp = int(time.time() * 1000)  # milliseconds
+            
+            # Save camera 0 frame
+            frame0_filename = f"camera0_frame_{frame_number:06d}_{timestamp}.jpg"
+            frame0_path = os.path.join(self.output_directory, frame0_filename)
+            cv2.imwrite(frame0_path, frame_pair['frame0'])
+            
+            # Save camera 1 frame  
+            frame1_filename = f"camera1_frame_{frame_number:06d}_{timestamp}.jpg"
+            frame1_path = os.path.join(self.output_directory, frame1_filename)
+            cv2.imwrite(frame1_path, frame_pair['frame1'])
+            
+            # Save metadata as text file
+            metadata_filename = f"metadata_frame_{frame_number:06d}_{timestamp}.txt"
+            metadata_path = os.path.join(self.output_directory, metadata_filename)
+            
+            with open(metadata_path, 'w') as f:
+                f.write(f"Frame Number: {frame_number}\n")
+                f.write(f"Timestamp: {frame_pair['timestamp']}\n")
+                f.write(f"Hardware Synced: {frame_pair['hardware_synced']}\n")
+                f.write(f"Homography Corrected: {frame_pair['homography_corrected']}\n")
+                f.write(f"Corrected Camera: {frame_pair.get('corrected_camera', 'None')}\n")
+                f.write(f"Debug Mode: {frame_pair.get('debug_mode', False)}\n")
+                if frame_pair.get('debug_mode'):
+                    f.write(f"Debug Frame Number: {frame_pair.get('debug_frame_number', 'N/A')}\n")
+                f.write(f"Camera 0 File: {frame0_filename}\n")
+                f.write(f"Camera 1 File: {frame1_filename}\n")
+            
+            # Log every 10th frame to avoid spam
+            if frame_number % 10 == 0:
+                self.logger.info(f"📁 Saved frame pair {frame_number} to {self.output_directory}")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to save frame pair {frame_number}: {e}")
+
     def _perform_auto_calibration(self) -> bool:
         """
         Perform automatic homography calibration by capturing frames
@@ -461,6 +526,10 @@ class HardwareSyncDualCamera:
                 self.stats['server_frames'] += 1
                 self.stats['client_frames'] += 1
                 
+                # Update debug mode counter
+                if self.debug_mode:
+                    self.debug_frames_captured += 1
+                
                 # Create synchronized frame pair with one camera corrected
                 timestamp = time.time() * 1000
                 corrected_camera = 1 if self.correct_camera1_to_camera0 else 0
@@ -470,8 +539,14 @@ class HardwareSyncDualCamera:
                     'timestamp': timestamp,
                     'hardware_synced': True,
                     'homography_corrected': self.enable_homography and self.homography_loaded,
-                    'corrected_camera': corrected_camera if (self.enable_homography and self.homography_loaded) else None
+                    'corrected_camera': corrected_camera if (self.enable_homography and self.homography_loaded) else None,
+                    'debug_mode': self.debug_mode,
+                    'debug_frame_number': self.debug_frames_captured if self.debug_mode else None
                 }
+                
+                # Save frames to disk if enabled
+                if self.save_output:
+                    self._save_frame_pair(frame_pair, self.debug_frames_captured)
                 
                 # Add to queue
                 try:
@@ -485,6 +560,12 @@ class HardwareSyncDualCamera:
                         self.stats['dropped_frames'] += 1
                     except:
                         pass
+                
+                # Check for debug mode completion
+                if self.debug_mode and self.debug_frames_captured >= self.debug_frame_limit:
+                    self.logger.info(f"🔍 Debug mode: Captured {self.debug_frames_captured} frames, stopping capture")
+                    self.running = False
+                    break
         
         except Exception as e:
             if self.running:
@@ -550,7 +631,10 @@ class HardwareSyncDualCamera:
             'homography_loaded': self.homography_loaded,
             'auto_calibrate_enabled': self.auto_calibrate,
             'calibration_needed': self.calibration_needed,
-            'flip_camera1_enabled': self.flip_camera1
+            'flip_camera1_enabled': self.flip_camera1,
+            'debug_mode': self.debug_mode,
+            'debug_frames_captured': self.debug_frames_captured if self.debug_mode else None,
+            'debug_frame_limit': self.debug_frame_limit if self.debug_mode else None
         })
         return stats
     
@@ -641,7 +725,8 @@ def main():
         correct_camera1_to_camera0=True,  # Correct camera 1 to match camera 0
         auto_calibrate=True,  # Enable auto-calibration if no homography file
         calibration_frames=15,  # Number of frames for calibration
-        calibration_first_frame=7  # First frame to use for calculation
+        calibration_first_frame=1,  # First frame to use for calculation
+        save_output=True
     )
     
     try:
@@ -722,5 +807,91 @@ def main():
         capture.stop_capture()
 
 
+def debug_mode_example():
+    """Example usage of debug mode with limited frame capture"""
+    
+    print("🔍 Debug Mode Example - Capturing only 30 frames")
+    
+    # Create hardware sync capture in debug mode
+    capture = HardwareSyncDualCamera(
+        width=1280,
+        height=720,
+        framerate=10,  # Lower framerate for testing
+        bitrate=4000000,  # 4 Mbps for 720p
+        flip_camera1=True,
+        enable_homography=True,
+        homography_file="wallCalibration_image_720.pickle",
+        correct_camera1_to_camera0=True,
+        auto_calibrate=True,
+        calibration_frames=15,
+        calibration_first_frame=1,
+        debug_mode=True,  # Enable debug mode
+        debug_frame_limit=30,  # Capture only 30 frames
+        save_output=True,  # Save frames to disk
+        output_directory="debug_capture_frames"  # Save to this directory
+    )
+    
+    try:
+        # Display configuration
+        print("🔧 Debug Configuration:")
+        stats = capture.get_stats()
+        print(f"   🔍 Debug Mode: {'✅' if stats['debug_mode'] else '❌'}")
+        print(f"   📊 Frame Limit: {stats['debug_frame_limit']}")
+        print(f"   🎥 Resolution: {capture.width}x{capture.height}")
+        print(f"   📸 Framerate: {capture.framerate} fps")
+        print(f"   💾 Save Output: {'✅' if capture.save_output else '❌'}")
+        if capture.save_output:
+            print(f"   📁 Output Directory: {capture.output_directory}")
+        
+        if not capture.start_capture():
+            print("❌ Failed to start debug capture")
+            return
+        
+        print("\n🎬 Starting debug capture...")
+        frame_count = 0
+        
+        while capture.running:
+            frame_pair = capture.get_synchronized_frames(timeout=2.0)
+            
+            if frame_pair is None:
+                print(".", end="", flush=True)
+                continue
+            
+            frame_count += 1
+            debug_frame_num = frame_pair.get('debug_frame_number', '?')
+            
+            # Display progress
+            print(f"\r📹 Frame {frame_count} (Debug #{debug_frame_num})", end="", flush=True)
+            
+            # Check if debug mode completed
+            if frame_pair.get('debug_mode') and not capture.running:
+                print(f"\n✅ Debug capture completed!")
+                break
+        
+        # Final statistics
+        final_stats = capture.get_stats()
+        print(f"\n📊 Debug Results:")
+        print(f"   🎯 Frames captured: {final_stats['debug_frames_captured']}")
+        print(f"   📊 Synchronized pairs: {final_stats['synchronized_pairs']}")
+        print(f"   🔧 Homography applied: {'✅' if final_stats['homography_loaded'] else '❌'}")
+        
+        if capture.save_output:
+            total_files = final_stats['debug_frames_captured'] * 3  # 2 images + 1 metadata per frame
+            print(f"   💾 Files saved: {total_files} ({final_stats['debug_frames_captured']} frame pairs)")
+            print(f"   📁 Location: {capture.output_directory}")
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Debug stopped by user")
+    except Exception as e:
+        print(f"❌ Debug error: {e}")
+    finally:
+        capture.stop_capture()
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--debug":
+        debug_mode_example()
+    else:
+        main()
