@@ -2,6 +2,7 @@
 """
 Hardware Synchronized Dual Camera Capture using rpicam-vid --sync
 Uses the server/client sync feature for precise hardware synchronization
+with optional homography correction for image alignment
 
 Author: Matthew Boillat
 Date: October 2025
@@ -19,6 +20,8 @@ from typing import Optional, Tuple
 from queue import Queue, Empty
 import tempfile
 import os
+from CalibrationFileManager import CalibrationFileManager
+from alignImages import align_fromHomography
 
 class HardwareSyncDualCamera:
     """
@@ -31,7 +34,10 @@ class HardwareSyncDualCamera:
                  framerate: int = 30,
                  bitrate: int = 10000000,
                  buffer_size: int = 10,
-                 flip_camera1: bool = True):
+                 flip_camera1: bool = True,
+                 enable_homography: bool = True,
+                 homography_file: str = "wallCalibration_image_1080.pickle",
+                 correct_camera1_to_camera0: bool = True):
         """
         Initialize hardware synchronized capture
         
@@ -42,6 +48,10 @@ class HardwareSyncDualCamera:
             bitrate: Video bitrate for H.264 encoding
             buffer_size: Frame buffer size
             flip_camera1: Flip camera 1 frames horizontally (left/right)
+            enable_homography: Enable homography correction
+            homography_file: Homography matrix file
+            correct_camera1_to_camera0: If True, correct camera 1 to match camera 0 (typical)
+                                      If False, correct camera 0 to match camera 1
         """
         self.width = width
         self.height = height
@@ -49,6 +59,17 @@ class HardwareSyncDualCamera:
         self.bitrate = bitrate
         self.buffer_size = buffer_size
         self.flip_camera1 = flip_camera1
+        self.enable_homography = enable_homography
+        self.correct_camera1_to_camera0 = correct_camera1_to_camera0
+        
+        # Homography support
+        self.homography_matrix: Optional[np.ndarray] = None
+        self.calibration_manager: Optional[CalibrationFileManager] = None
+        self.homography_loaded = False
+        
+        # Initialize homography if enabled
+        if self.enable_homography:
+            self._initialize_homography(homography_file)
         
         # Temporary files for H.264 streams
         self.temp_dir = tempfile.mkdtemp(prefix="sync_cameras_")
@@ -79,7 +100,9 @@ class HardwareSyncDualCamera:
             'server_frames': 0,
             'client_frames': 0,
             'synchronized_pairs': 0,
-            'dropped_frames': 0
+            'dropped_frames': 0,
+            'homography_corrections': 0,
+            'homography_failures': 0
         }
         
         # Setup logging
@@ -95,6 +118,75 @@ class HardwareSyncDualCamera:
         self.logger.info("Shutting down...")
         self.stop_capture()
         sys.exit(0)
+    
+    def _initialize_homography(self, homography_file: str):
+        """
+        Initialize homography correction by loading calibration matrices
+        
+        Args:
+            homography_file: Path to the homography calibration file
+        """
+        try:
+            self.calibration_manager = CalibrationFileManager(homography_file)
+            self.homography_matrix = self.calibration_manager.load_homography_matrix()
+            
+            if self.homography_matrix is not None:
+                self.homography_loaded = True
+                self.logger.info("✅ Homography matrix loaded successfully")
+                self.logger.info(f"   Matrix shape: {self.homography_matrix.shape}")
+                
+                # Validate homography matrix
+                if self.homography_matrix.shape != (3, 3):
+                    self.logger.error("❌ Invalid homography matrix shape")
+                    self.homography_loaded = False
+                    return
+                
+                # Check for reasonable values
+                det = np.linalg.det(self.homography_matrix)
+                if abs(det) < 1e-10:
+                    self.logger.error("❌ Homography matrix appears to be singular")
+                    self.homography_loaded = False
+                    return
+                    
+                self.logger.info(f"   Matrix determinant: {det:.6f}")
+                
+            else:
+                self.logger.warning("⚠️  No homography matrix found - alignment disabled")
+                self.homography_loaded = False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to initialize homography: {e}")
+            self.homography_loaded = False
+    
+    def _apply_homography_correction(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply homography correction to a frame
+        
+        Args:
+            frame: Input frame to correct
+            
+        Returns:
+            Corrected frame, or original frame if correction fails
+        """
+        if not self.homography_loaded or self.homography_matrix is None:
+            return frame
+            
+        try:
+            # Apply homography transformation
+            corrected_frame = align_fromHomography(frame, self.homography_matrix)
+            
+            if corrected_frame is not None:
+                self.stats['homography_corrections'] += 1
+                return corrected_frame
+            else:
+                self.stats['homography_failures'] += 1
+                self.logger.warning("⚠️  Homography correction failed, using original frame")
+                return frame
+                
+        except Exception as e:
+            self.stats['homography_failures'] += 1
+            self.logger.error(f"❌ Error applying homography: {e}")
+            return frame
     
     def _build_camera_command(self, camera_id: int, is_server: bool, output_path: str) -> list:
         """
@@ -219,17 +311,33 @@ class HardwareSyncDualCamera:
                 if self.flip_camera1:
                     frame_client = cv2.flip(frame_client, 1)  # 1 = horizontal flip
                 
+                # Apply homography correction to only one camera if enabled
+                if self.enable_homography and self.homography_loaded:
+                    if self.correct_camera1_to_camera0:
+                        # Correct camera 1 to match camera 0's perspective (typical case)
+                        frame_client_corrected = self._apply_homography_correction(frame_client)
+                        frame_client = frame_client_corrected
+                        # Camera 0 remains as reference (uncorrected)
+                    else:
+                        # Correct camera 0 to match camera 1's perspective (less common)
+                        frame_server_corrected = self._apply_homography_correction(frame_server)
+                        frame_server = frame_server_corrected
+                        # Camera 1 remains as reference (uncorrected)
+                
                 # Update statistics
                 self.stats['server_frames'] += 1
                 self.stats['client_frames'] += 1
                 
-                # Create synchronized frame pair
+                # Create synchronized frame pair with one camera corrected
                 timestamp = time.time() * 1000
+                corrected_camera = 1 if self.correct_camera1_to_camera0 else 0
                 frame_pair = {
                     'frame0': frame_server,  # Server camera (camera 0)
-                    'frame1': frame_client,  # Client camera (camera 1)
+                    'frame1': frame_client,  # Client camera (camera 1) - flipped if enabled
                     'timestamp': timestamp,
-                    'hardware_synced': True
+                    'hardware_synced': True,
+                    'homography_corrected': self.enable_homography and self.homography_loaded,
+                    'corrected_camera': corrected_camera if (self.enable_homography and self.homography_loaded) else None
                 }
                 
                 # Add to queue
@@ -303,7 +411,39 @@ class HardwareSyncDualCamera:
     
     def get_stats(self) -> dict:
         """Get capture statistics"""
-        return self.stats.copy()
+        stats = self.stats.copy()
+        stats.update({
+            'homography_enabled': self.enable_homography,
+            'homography_loaded': self.homography_loaded,
+            'flip_camera1_enabled': self.flip_camera1
+        })
+        return stats
+    
+    def get_homography_status(self) -> dict:
+        """
+        Get detailed homography status information
+        
+        Returns:
+            Dictionary with homography configuration and status
+        """
+        status = {
+            'homography_enabled': self.enable_homography,
+            'homography_loaded': self.homography_loaded,
+            'homography_matrix_available': self.homography_matrix is not None,
+            'correct_camera1_to_camera0': self.correct_camera1_to_camera0,
+            'corrected_camera': 1 if self.correct_camera1_to_camera0 else 0,
+            'reference_camera': 0 if self.correct_camera1_to_camera0 else 1,
+            'corrections_applied': self.stats.get('homography_corrections', 0),
+            'correction_failures': self.stats.get('homography_failures', 0)
+        }
+        
+        if self.homography_matrix is not None:
+            status.update({
+                'matrix_shape': self.homography_matrix.shape,
+                'matrix_determinant': float(np.linalg.det(self.homography_matrix))
+            })
+        
+        return status
 
 
 def frame_difference_analysis(frame0: np.ndarray, frame1: np.ndarray) -> dict:
@@ -348,30 +488,49 @@ def frame_difference_analysis(frame0: np.ndarray, frame1: np.ndarray) -> dict:
 
 
 def main():
-    """Example usage of hardware synchronized capture"""
+    """Example usage of hardware synchronized capture with homography correction"""
     
-    # Create hardware sync capture with 1080p resolution
+    # Create hardware sync capture with 1080p resolution and homography correction
     capture = HardwareSyncDualCamera(
         width=1920,
         height=1080,
         framerate=15,  # Start with lower framerate
         bitrate=8000000,  # 8 Mbps for 1080p
-        flip_camera1=True  # Flip camera 1 frames horizontally
+        flip_camera1=True,  # Flip camera 1 frames horizontally
+        enable_homography=True,  # Enable homography correction
+        homography_file="wallCalibration_image_1080.pickle",
+        correct_camera1_to_camera0=True  # Correct camera 1 to match camera 0
     )
     
     try:
+        # Display homography status
+        homography_status = capture.get_homography_status()
+        print("🔧 Homography Configuration:")
+        for key, value in homography_status.items():
+            status_icon = "✅" if value else "❌" if isinstance(value, bool) else "📊"
+            print(f"   {status_icon} {key}: {value}")
+        
+        if homography_status['homography_loaded']:
+            corrected_cam = homography_status['corrected_camera']
+            reference_cam = homography_status['reference_camera']
+            print(f"   🎯 Camera {corrected_cam} will be corrected to match Camera {reference_cam}")
+        
         if not capture.start_capture():
             print("❌ Failed to start hardware synchronized capture")
             return
         
-        print("✅ Hardware synchronized capture started!")
+        print("\n✅ Hardware synchronized capture started!")
+        if homography_status['homography_loaded']:
+            print("🎯 Homography correction ENABLED - one camera will be aligned")
+        else:
+            print("⚠️  Homography correction DISABLED - frames may not be aligned")
         print("🔄 Processing synchronized frames...")
         print("Press Ctrl+C to stop")
         
         frame_count = 0
         
         while True:
-            # Get hardware synchronized frames
+            # Get hardware synchronized frames (now with single-camera homography correction)
             frame_pair = capture.get_synchronized_frames(timeout=2.0)
             
             if frame_pair is None:
@@ -380,23 +539,27 @@ def main():
             
             frame_count += 1
             
-            # Perform difference analysis
+            # Perform difference analysis on aligned frames
             analysis = frame_difference_analysis(
-                frame_pair['frame0'],
-                frame_pair['frame1']
+                frame_pair['frame0'],  # Camera 0 (reference or corrected)
+                frame_pair['frame1']   # Camera 1 (corrected or reference) + flipped
             )
             
             # Print results
             if frame_count % 10 == 0:
-                print(f"\n📊 Frame {frame_count} (Hardware Synced):")
+                corrected_camera = frame_pair.get('corrected_camera', 'None')
+                print(f"\n📊 Frame {frame_count} (Hardware Synced + Camera {corrected_camera} Corrected):")
                 print(f"   📊 Mean diff: {analysis['mean_difference']:.2f}")
                 print(f"   🎯 Diff area: {analysis['difference_percentage']:.2f}%")
                 print(f"   📍 Regions: {analysis['num_difference_regions']}")
+                print(f"   🔧 Homography: {'✅' if frame_pair.get('homography_corrected', False) else '❌'}")
                 
-                # Statistics
+                # Statistics including homography
                 stats = capture.get_stats()
                 print(f"   📈 Total pairs: {stats['synchronized_pairs']}")
+                print(f"   🎯 Homography corrections: {stats['homography_corrections']}")
                 print(f"   ❌ Dropped: {stats['dropped_frames']}")
+                print(f"   ⚠️  Homography failures: {stats['homography_failures']}")
             
             # Status indicator
             status = "🔴" if analysis['difference_percentage'] > 1.0 else "🟢"
