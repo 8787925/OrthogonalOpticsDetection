@@ -33,19 +33,21 @@ class SynchronizedDualCameraCapture:
                  buffer_size: int = 10,
                  sync_tolerance_ms: int = 33,  # ~1 frame at 30fps
                  use_hardware_sync: bool = True,
-                 sync_method: str = "server_client"):  # "server_client" or "timestamp"
+                 sync_method: str = "server_client",  # "server_client" or "timestamp"
+                 flip_camera1: bool = True):
         """
         Initialize the synchronized dual camera capture
         
         Args:
-            width: Video width in pixels
-            height: Video height in pixels
+            width: Video width in pixels (default 1920 for 1080p)
+            height: Video height in pixels (default 1080 for 1080p)
             framerate: Frames per second
             capture_format: Output format ("bgr", "rgb", "yuv420", "gray")
             buffer_size: Maximum number of frame pairs to buffer
             sync_tolerance_ms: Maximum time difference for frame synchronization (ms)
             use_hardware_sync: Use rpicam-vid --sync feature for hardware sync
             sync_method: "server_client" (uses --sync) or "timestamp" (software sync)
+            flip_camera1: Flip camera 1 frames horizontally (left/right)
         """
         self.width = width
         self.height = height
@@ -55,6 +57,7 @@ class SynchronizedDualCameraCapture:
         self.sync_tolerance_ms = sync_tolerance_ms
         self.use_hardware_sync = use_hardware_sync
         self.sync_method = sync_method
+        self.flip_camera1 = flip_camera1
         
         # Frame queues for each camera
         self.camera0_queue = Queue(maxsize=buffer_size)
@@ -281,7 +284,7 @@ class SynchronizedDualCameraCapture:
                         continue
                 
                 # Convert YUV420 to the desired format
-                frame = self._convert_yuv420_to_target(frame_data)
+                frame = self._convert_yuv420_to_target(frame_data, camera_id)
                 
                 # Add timestamp
                 timestamp = time.time() * 1000  # milliseconds
@@ -313,12 +316,13 @@ class SynchronizedDualCameraCapture:
                     self.logger.error(f"Error capturing from camera {camera_id}: {e}")
                 break
     
-    def _convert_yuv420_to_target(self, yuv_data: bytes) -> np.ndarray:
+    def _convert_yuv420_to_target(self, yuv_data: bytes, camera_id: int = 0) -> np.ndarray:
         """
         Convert YUV420 data to target format
         
         Args:
             yuv_data: Raw YUV420 bytes
+            camera_id: Camera ID (used for flipping camera 1)
             
         Returns:
             Converted frame as numpy array
@@ -343,13 +347,19 @@ class SynchronizedDualCameraCapture:
         
         # Convert to target format
         if self.capture_format == "bgr":
-            return cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2BGR)
+            frame = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2BGR)
         elif self.capture_format == "rgb":
-            return cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2RGB)
+            frame = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2RGB)
         elif self.capture_format == "gray":
-            return y_plane
+            frame = y_plane
         else:  # yuv420
-            return yuv_frame
+            frame = yuv_frame
+        
+        # Flip camera 1 frames horizontally if requested
+        if camera_id == 1 and self.flip_camera1:
+            frame = cv2.flip(frame, 1)  # 1 = horizontal flip (left/right)
+        
+        return frame
     
     def _synchronize_frames(self):
         """
@@ -585,14 +595,15 @@ def frame_difference_analysis(frame0: np.ndarray, frame1: np.ndarray) -> dict:
 def main():
     """Example usage of synchronized dual camera capture"""
     
-    # Create capture instance
+    # Create capture instance with 1080p resolution
     capture = SynchronizedDualCameraCapture(
-        width=1280,
-        height=720,
+        width=1920,
+        height=1080,
         framerate=30,
         capture_format="bgr",
         buffer_size=5,
-        sync_tolerance_ms=33  # ~1 frame tolerance
+        sync_tolerance_ms=33,  # ~1 frame tolerance
+        flip_camera1=True  # Flip camera 1 frames horizontally
     )
     
     try:

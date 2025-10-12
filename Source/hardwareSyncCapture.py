@@ -30,22 +30,25 @@ class HardwareSyncDualCamera:
                  height: int = 1080,
                  framerate: int = 30,
                  bitrate: int = 10000000,
-                 buffer_size: int = 10):
+                 buffer_size: int = 10,
+                 flip_camera1: bool = True):
         """
         Initialize hardware synchronized capture
         
         Args:
-            width: Video width
-            height: Video height
+            width: Video width (default 1920 for 1080p)
+            height: Video height (default 1080 for 1080p)
             framerate: Frames per second
             bitrate: Video bitrate for H.264 encoding
             buffer_size: Frame buffer size
+            flip_camera1: Flip camera 1 frames horizontally (left/right)
         """
         self.width = width
         self.height = height
         self.framerate = framerate
         self.bitrate = bitrate
         self.buffer_size = buffer_size
+        self.flip_camera1 = flip_camera1
         
         # Temporary files for H.264 streams
         self.temp_dir = tempfile.mkdtemp(prefix="sync_cameras_")
@@ -212,6 +215,10 @@ class HardwareSyncDualCamera:
                         self.logger.warning("Failed to read from one or both cameras")
                     break
                 
+                # Flip camera 1 (client) frame horizontally if requested
+                if self.flip_camera1:
+                    frame_client = cv2.flip(frame_client, 1)  # 1 = horizontal flip
+                
                 # Update statistics
                 self.stats['server_frames'] += 1
                 self.stats['client_frames'] += 1
@@ -343,12 +350,13 @@ def frame_difference_analysis(frame0: np.ndarray, frame1: np.ndarray) -> dict:
 def main():
     """Example usage of hardware synchronized capture"""
     
-    # Create hardware sync capture
+    # Create hardware sync capture with 1080p resolution
     capture = HardwareSyncDualCamera(
-        width=1280,
-        height=720,
+        width=1920,
+        height=1080,
         framerate=15,  # Start with lower framerate
-        bitrate=5000000  # 5 Mbps
+        bitrate=8000000,  # 8 Mbps for 1080p
+        flip_camera1=True  # Flip camera 1 frames horizontally
     )
     
     try:

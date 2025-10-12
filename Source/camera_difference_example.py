@@ -19,14 +19,15 @@ def simple_difference_monitor():
     """
     print("Starting simple dual camera difference monitoring...")
     
-    # Create capture with lower resolution for faster processing
+    # Create capture with 1080p resolution for better quality
     capture = SynchronizedDualCameraCapture(
-        width=640,
-        height=480,
+        width=1920,
+        height=1080,
         framerate=15,  # Lower framerate for easier processing
         capture_format="bgr",
         buffer_size=3,
-        sync_tolerance_ms=66  # ~1 frame tolerance at 15fps
+        sync_tolerance_ms=66,  # ~1 frame tolerance at 15fps
+        flip_camera1=True  # Flip camera 1 frames horizontally
     )
     
     try:
@@ -106,10 +107,11 @@ def save_difference_images():
     print("Starting difference detection with image saving...")
     
     capture = SynchronizedDualCameraCapture(
-        width=1280,
-        height=720,
+        width=1920,
+        height=1080,
         framerate=10,
-        capture_format="bgr"
+        capture_format="bgr",
+        flip_camera1=True  # Flip camera 1 frames horizontally
     )
     
     # Create output directory

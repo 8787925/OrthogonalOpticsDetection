@@ -14,6 +14,7 @@ from matplotlib import pyplot as plt
 import pickle
 import logging
 from websockets.exceptions import ConnectionClosed, WebSocketException
+from CalibrationFileManager import CalibrationFileManager
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
@@ -139,15 +140,21 @@ FIRST_SENSITIVITY_FRAME = FIRST_CALIBRATION_FRAME
 DIFFERENCE_GAIN = 5
 DIFFERENCE_FLOOR = 100
 
-if os.path.exists(SENSITIVITY_MAP_NAME): 
-    with open(SENSITIVITY_MAP_NAME, 'rb') as f:
-        Sensitivity_Map = pickle.load(f)
-    sensitivityMapNeeded = False
+# Initialize calibration file manager
+calibration_manager = CalibrationFileManager(HOMOGRAPHY_CALIBRATION_NAME, SENSITIVITY_MAP_NAME)
 
-if os.path.exists(HOMOGRAPHY_CALIBRATION_NAME): 
-    with open(HOMOGRAPHY_CALIBRATION_NAME, 'rb') as f:
-        HomographyMatrix = pickle.load(f)
-    CALIBRATION_NEEDED = False
+# Load existing calibration files using the manager
+HomographyMatrix, Sensitivity_Map = calibration_manager.load_both_calibrations()
+
+# Set calibration status based on loaded files
+CALIBRATION_NEEDED = HomographyMatrix is None
+sensitivityMapNeeded = Sensitivity_Map is None
+
+# Initialize empty arrays if calibration data wasn't loaded
+if HomographyMatrix is None:
+    HomographyMatrix = []
+if Sensitivity_Map is None:
+    Sensitivity_Map = []
 
 localCamera = Picamera2()
 camera_configa = localCamera.create_still_configuration(
@@ -496,13 +503,15 @@ async def perform_calibration_routine(websocket):
         homography_matrices.append(align_images(local_frame, remote_frame))
         print(f'Frame comparison {j} completed out of {len(calibration_local_frames)}')
     
-    # Save homography matrix
+    # Save homography matrix using calibration manager
     HomographyMatrix = np.mean(homography_matrices, axis=0)
-    with open(HOMOGRAPHY_CALIBRATION_NAME, 'wb') as f:
-        pickle.dump(HomographyMatrix, f)
-    
-    CALIBRATION_NEEDED = False
-    return True
+    if calibration_manager.save_homography_matrix(HomographyMatrix):
+        logger.info("Homography matrix saved successfully")
+        CALIBRATION_NEEDED = False
+        return True
+    else:
+        logger.error("Failed to save homography matrix")
+        return False
 
 async def perform_sensitivity_mapping(websocket):
     """Generate sensitivity mapping between cameras using buffered approach"""
@@ -801,9 +810,11 @@ def sensitivityMapRoutine(accumulate_frame, local_frames, remote_frames):
     float_map = np.abs(float_map)
     Sensitivity_Map = np.reciprocal(float_map + 1)  # +1 accounts for perfect match approaching 0
 
-    # Save sensitivity map
-    with open(SENSITIVITY_MAP_NAME, 'wb') as f:
-        pickle.dump(Sensitivity_Map, f)
+    # Save sensitivity map using calibration manager
+    if calibration_manager.save_sensitivity_map(Sensitivity_Map):
+        logger.info("Sensitivity map saved successfully")
+    else:
+        logger.error("Failed to save sensitivity map")
 
     # Create visualization images
     sensitivity_image = np.zeros((1080, 1920, 3), dtype=np.uint8)
