@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 from queue import Queue, Empty
 import tempfile
 import os
+import socket
 from CalibrationFileManager import CalibrationFileManager
 from alignImages import align_fromHomography
 from HomographyCalibrator import calculate_homography_from_frames
@@ -113,14 +114,18 @@ class HardwareSyncDualCamera:
         if self.enable_homography:
             self._initialize_homography(homography_file)
         
-        # Temporary files for H.264 streams
-        self.temp_dir = tempfile.mkdtemp(prefix="sync_cameras_")
-        self.server_fifo = os.path.join(self.temp_dir, "server_stream")
-        self.client_fifo = os.path.join(self.temp_dir, "client_stream")
+        # TCP streaming configuration (replaces named pipes)
+        # Find available ports automatically
+        self.server_tcp_port, self.client_tcp_port = self._find_available_tcp_ports()
+        self.server_tcp_url = f"tcp://127.0.0.1:{self.server_tcp_port}"
+        self.client_tcp_url = f"tcp://127.0.0.1:{self.client_tcp_port}"
         
-        # Create named pipes
-        os.mkfifo(self.server_fifo)
-        os.mkfifo(self.client_fifo)
+        self.logger.info(f"🌐 TCP Streaming Configuration:")
+        self.logger.info(f"   Server (Camera 0): {self.server_tcp_url}")
+        self.logger.info(f"   Client (Camera 1): {self.client_tcp_url}")
+        
+        # Keep temp_dir for potential future use, but no longer create FIFOs
+        self.temp_dir = tempfile.mkdtemp(prefix="sync_cameras_")
         
         # Process handles
         self.server_process: Optional[subprocess.Popen] = None
@@ -156,6 +161,42 @@ class HardwareSyncDualCamera:
         # Register cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _check_tcp_port_available(self, port: int) -> bool:
+        """
+        Check if a TCP port is available for use
+        
+        Args:
+            port: Port number to check
+            
+        Returns:
+            True if port is available, False otherwise
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(('127.0.0.1', port))
+                return True
+        except OSError:
+            return False
+    
+    def _find_available_tcp_ports(self, start_port: int = 8000) -> Tuple[int, int]:
+        """
+        Find two consecutive available TCP ports
+        
+        Args:
+            start_port: Starting port to search from
+            
+        Returns:
+            Tuple of (server_port, client_port)
+        """
+        for port in range(start_port, start_port + 100, 2):  # Check even ports
+            if (self._check_tcp_port_available(port) and 
+                self._check_tcp_port_available(port + 1)):
+                return port, port + 1
+        
+        # Fallback to default if no consecutive ports found
+        self.logger.warning("⚠️  Could not find consecutive TCP ports, using defaults")
+        return 8000, 8001
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
@@ -360,12 +401,12 @@ class HardwareSyncDualCamera:
             original_homography_loaded = self.homography_loaded
             self.homography_loaded = False  # Disable correction during calibration
             
-            # Open video streams from named pipes for calibration
-            server_cap = cv2.VideoCapture(self.server_fifo)
-            client_cap = cv2.VideoCapture(self.client_fifo)
+            # Open video streams from TCP URLs for calibration
+            server_cap = cv2.VideoCapture(self.server_tcp_url)
+            client_cap = cv2.VideoCapture(self.client_tcp_url)
             
             if not server_cap.isOpened() or not client_cap.isOpened():
-                self.logger.error("❌ Failed to open video streams for calibration")
+                self.logger.error("❌ Failed to open TCP video streams for calibration")
                 return False
             
             camera0_frames = []
@@ -442,14 +483,14 @@ class HardwareSyncDualCamera:
             # Restore original homography state
             self.homography_loaded = original_homography_loaded
     
-    def _build_camera_command(self, camera_id: int, is_server: bool, output_path: str) -> list:
+    def _build_camera_command(self, camera_id: int, is_server: bool, tcp_url: str) -> list:
         """
-        Build rpicam-vid command with hardware sync
+        Build rpicam-vid command with hardware sync using TCP streaming
         
         Args:
             camera_id: Camera index (0 or 1)
             is_server: True for server, False for client
-            output_path: Output file path
+            tcp_url: TCP URL for streaming output
             
         Returns:
             Command list
@@ -465,7 +506,8 @@ class HardwareSyncDualCamera:
             '--bitrate', str(self.bitrate),
             '--codec', 'libav',
             '--libav-format', 'h264',
-            '-o', output_path
+            '--libav-audio', '0',  # Disable audio for TCP streaming
+            '-o', tcp_url
         ]
         
         # Add sync parameter
@@ -487,8 +529,8 @@ class HardwareSyncDualCamera:
         self.running = True
         
         try:
-            # Start server camera (camera 0)
-            server_cmd = self._build_camera_command(0, True, self.server_fifo)
+            # Start server camera (camera 0) - TCP streaming
+            server_cmd = self._build_camera_command(0, True, self.server_tcp_url)
             self.logger.info(f"Starting server camera: {' '.join(server_cmd)}")
             self.server_process = subprocess.Popen(
                 server_cmd,
@@ -496,8 +538,8 @@ class HardwareSyncDualCamera:
                 stderr=subprocess.PIPE
             )
             
-            # Start client camera (camera 1)
-            client_cmd = self._build_camera_command(1, False, self.client_fifo)
+            # Start client camera (camera 1) - TCP streaming
+            client_cmd = self._build_camera_command(1, False, self.client_tcp_url)
             self.logger.info(f"Starting client camera: {' '.join(client_cmd)}")
             self.client_process = subprocess.Popen(
                 client_cmd,
@@ -538,25 +580,56 @@ class HardwareSyncDualCamera:
     
     def _capture_synchronized_frames(self):
         """
-        Capture synchronized frames using OpenCV VideoCapture
+        Capture synchronized frames using OpenCV VideoCapture with TCP streaming
         """
         try:
-            # Open video streams from named pipes
-            self.logger.info("Opening video streams...")
+            # Wait for TCP streams to be available
+            self.logger.info("Waiting for TCP streams to be available...")
+            time.sleep(5)  # Give more time for TCP streams to establish
             
-            # Open server stream
-            self.server_cap = cv2.VideoCapture(self.server_fifo)
-            if not self.server_cap.isOpened():
-                self.logger.error("Failed to open server video stream")
-                return
+            # Open video streams from TCP URLs with retry logic
+            self.logger.info("Opening TCP video streams...")
             
-            # Open client stream  
-            self.client_cap = cv2.VideoCapture(self.client_fifo)
-            if not self.client_cap.isOpened():
-                self.logger.error("Failed to open client video stream")
-                return
+            # Retry opening streams up to 3 times
+            max_retries = 3
+            for attempt in range(max_retries):
+                # Open server stream with TCP
+                self.server_cap = cv2.VideoCapture(self.server_tcp_url)
+                if self.server_cap.isOpened():
+                    self.logger.info(f"✅ Server TCP stream opened: {self.server_tcp_url}")
+                    break
+                else:
+                    self.logger.warning(f"⚠️  Attempt {attempt + 1}/{max_retries}: Failed to open server TCP stream")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                    else:
+                        self.logger.error(f"❌ Failed to open server TCP stream after {max_retries} attempts: {self.server_tcp_url}")
+                        return
             
-            self.logger.info("Video streams opened successfully")
+            # Open client stream with TCP
+            for attempt in range(max_retries):
+                self.client_cap = cv2.VideoCapture(self.client_tcp_url)
+                if self.client_cap.isOpened():
+                    self.logger.info(f"✅ Client TCP stream opened: {self.client_tcp_url}")
+                    break
+                else:
+                    self.logger.warning(f"⚠️  Attempt {attempt + 1}/{max_retries}: Failed to open client TCP stream")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                    else:
+                        self.logger.error(f"❌ Failed to open client TCP stream after {max_retries} attempts: {self.client_tcp_url}")
+                        return
+            
+            # Configure minimal buffering for better synchronization
+            self.server_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.client_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # Additional TCP-specific optimizations
+            # Set timeout for read operations (in milliseconds)
+            self.server_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            self.client_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            
+            self.logger.info("🌐 TCP video streams configured successfully")
             
             while self.running:
                 # Start timing the loop iteration
@@ -702,10 +775,8 @@ class HardwareSyncDualCamera:
         if self.capture_thread and self.capture_thread.is_alive():
             self.capture_thread.join(timeout=5)
         
-        # Cleanup temporary files
+        # Cleanup temporary directory (no longer contains FIFOs)
         try:
-            os.unlink(self.server_fifo)
-            os.unlink(self.client_fifo)
             os.rmdir(self.temp_dir)
         except:
             pass
