@@ -15,6 +15,8 @@ import pickle
 import logging
 from websockets.exceptions import ConnectionClosed, WebSocketException
 from CalibrationFileManager import CalibrationFileManager
+from HomographyCalibrator import HomographyCalibrator
+from SensitivityMapper import SensitivityMapper
 
 #this code is meant to be ran on the computer who is running the 'Trigger' camera
 #
@@ -142,6 +144,21 @@ DIFFERENCE_FLOOR = 100
 
 # Initialize calibration file manager
 calibration_manager = CalibrationFileManager(HOMOGRAPHY_CALIBRATION_NAME, SENSITIVITY_MAP_NAME)
+
+# Initialize homography calibrator
+homography_calibrator = HomographyCalibrator(
+    calibration_frames=NUMBER_OF_CALIBRATION_FRAMES,
+    first_calibration_frame=FIRST_CALIBRATION_FRAME,
+    debug_output=True
+)
+
+# Initialize sensitivity mapper
+sensitivity_mapper = SensitivityMapper(
+    sensitivity_frames=NUMBER_OF_SENSITIVITY_FRAMES,
+    first_sensitivity_frame=FIRST_SENSITIVITY_FRAME,
+    debug_output=True,
+    camera_resolution=(CAMERA_H_RESOLUTION, CAMERA_V_RESOLUTION)
+)
 
 # Load existing calibration files using the manager
 HomographyMatrix, Sensitivity_Map = calibration_manager.load_both_calibrations()
@@ -491,20 +508,21 @@ async def perform_calibration_routine(websocket):
         cv2.imwrite(f'remoteCalImg{i}.jpg', remote_frame)
     
     await websocket.send(json.dumps({'action': 'CAMERA_OFF'}))
-    print("Calculating Homography")
     
-    # Use frames starting from FIRST_CALIBRATION_FRAME for homography calculation
-    calibration_local_frames = local_frames[FIRST_CALIBRATION_FRAME:]
-    calibration_remote_frames = remote_frames[FIRST_CALIBRATION_FRAME:]
+    # Calculate homography matrix using the calibrator
+    calculated_homography = homography_calibrator.calculate_homography_matrix(local_frames, remote_frames)
     
-    # Calculate homography matrices
-    homography_matrices = []
-    for j, (local_frame, remote_frame) in enumerate(zip(calibration_local_frames, calibration_remote_frames)):
-        homography_matrices.append(align_images(local_frame, remote_frame))
-        print(f'Frame comparison {j} completed out of {len(calibration_local_frames)}')
+    if calculated_homography is None:
+        logger.error("Failed to calculate homography matrix")
+        return False
+    
+    # Validate the calculated homography
+    if not homography_calibrator.validate_homography_matrix(calculated_homography):
+        logger.error("Calculated homography matrix failed validation")
+        return False
     
     # Save homography matrix using calibration manager
-    HomographyMatrix = np.mean(homography_matrices, axis=0)
+    HomographyMatrix = calculated_homography
     if calibration_manager.save_homography_matrix(HomographyMatrix):
         logger.info("Homography matrix saved successfully")
         CALIBRATION_NEEDED = False
@@ -554,19 +572,30 @@ async def perform_sensitivity_mapping(websocket):
         logger.error(f"Sensitivity frame count mismatch: local={len(local_frames)}, remote={len(remote_frames)}")
         return False
     
-    # Process only frames starting from FIRST_SENSITIVITY_FRAME
-    processed_local_frames = []
-    processed_remote_frames = []
+    # Generate sensitivity map using the mapper
+    global Sensitivity_Map, sensitivityMapNeeded
+    calculated_sensitivity_map = sensitivity_mapper.generate_sensitivity_map_from_raw_frames(
+        local_frames, remote_frames, HomographyMatrix
+    )
     
-    for i, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
-        if i >= FIRST_SENSITIVITY_FRAME:
-            aligned_local = align_fromHomography(local_frame, HomographyMatrix)
-            processed_local_frames.append(aligned_local)
-            processed_remote_frames.append(remote_frame)
+    if calculated_sensitivity_map is None:
+        logger.error("Failed to generate sensitivity map")
+        return False
     
-    # Process sensitivity data
-    sensitivityMapRoutine(False, processed_local_frames, processed_remote_frames)
-    return True
+    # Validate the calculated sensitivity map
+    if not sensitivity_mapper.validate_sensitivity_map(calculated_sensitivity_map):
+        logger.error("Calculated sensitivity map failed validation")
+        return False
+    
+    # Save sensitivity map using calibration manager
+    Sensitivity_Map = calculated_sensitivity_map
+    if calibration_manager.save_sensitivity_map(Sensitivity_Map):
+        logger.info("Sensitivity map saved successfully")
+        sensitivityMapNeeded = False
+        return True
+    else:
+        logger.error("Failed to save sensitivity map")
+        return False
 
 async def perform_detection_sequence(websocket):
     """Main detection sequence with LED flashing and buffered frame transfer"""
@@ -781,59 +810,6 @@ def performDifferenceIdentity(localFrame, remoteFrame):
     
     #Mark the floor-clearing areas in frame1 and output
     return localFrame
-
-def sensitivityMapRoutine(accumulate_frame, local_frames, remote_frames): 
-    """Generate sensitivity map from multiple frame pairs"""
-    global Sensitivity_Accumulation, Sensitivity_Map, Sensitivity_Frames_Accumulated
-    
-    if accumulate_frame:
-        # This mode is no longer used with the new structure
-        return
-    
-    if not local_frames or not remote_frames:
-        return
-        
-    # Process all frame pairs
-    difference_frames = []
-    for i, (local_frame, remote_frame) in enumerate(zip(local_frames, remote_frames)):
-        difference_frame = np.float32(local_frame) - np.float32(remote_frame)
-        difference_frames.append(difference_frame)
-        
-        # Save individual frames for debugging
-        cv2.imwrite(f'sensitivity_Diff{i}.jpg', np.uint8(np.abs(difference_frame)))
-        cv2.imwrite(f'sensitivity_Local{i}.jpg', np.abs(local_frame))
-        cv2.imwrite(f'sensitivity_Remote{i}.jpg', np.abs(remote_frame))
-    
-    # Calculate mean sensitivity map
-    stacked_sensitivity = np.stack(difference_frames, axis=0)
-    float_map = np.float32(np.mean(stacked_sensitivity, axis=0))
-    float_map = np.abs(float_map)
-    Sensitivity_Map = np.reciprocal(float_map + 1)  # +1 accounts for perfect match approaching 0
-
-    # Save sensitivity map using calibration manager
-    if calibration_manager.save_sensitivity_map(Sensitivity_Map):
-        logger.info("Sensitivity map saved successfully")
-    else:
-        logger.error("Failed to save sensitivity map")
-
-    # Create visualization images
-    sensitivity_image = np.zeros((1080, 1920, 3), dtype=np.uint8)
-    
-    # Blue channel
-    sensitivity_image[:,:,0] = np.uint8(Sensitivity_Map[:,:,0] * 255)
-    cv2.imwrite('./sensitivityMatrixBlue.png', sensitivity_image)
-    sensitivity_image[:,:,0] = 0
-    
-    # Green channel
-    sensitivity_image[:,:,1] = np.uint8(Sensitivity_Map[:,:,1] * 255)
-    cv2.imwrite('./sensitivityMatrixGreen.png', sensitivity_image)
-    sensitivity_image[:,:,1] = 0
-
-    # Red channel
-    sensitivity_image[:,:,2] = np.uint8(Sensitivity_Map[:,:,2] * 255)
-    cv2.imwrite('./sensitivityMatrixRed.png', sensitivity_image)
-    
-    print("Sensitivity mapping complete")
 
 if __name__ == "__main__":
     try:
