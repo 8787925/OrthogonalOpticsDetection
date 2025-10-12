@@ -22,6 +22,7 @@ import tempfile
 import os
 from CalibrationFileManager import CalibrationFileManager
 from alignImages import align_fromHomography
+from HomographyCalibrator import calculate_homography_from_frames
 
 class HardwareSyncDualCamera:
     """
@@ -37,7 +38,10 @@ class HardwareSyncDualCamera:
                  flip_camera1: bool = True,
                  enable_homography: bool = True,
                  homography_file: str = "wallCalibration_image_1080.pickle",
-                 correct_camera1_to_camera0: bool = True):
+                 correct_camera1_to_camera0: bool = True,
+                 auto_calibrate: bool = True,
+                 calibration_frames: int = 15,
+                 calibration_first_frame: int = 1):
         """
         Initialize hardware synchronized capture
         
@@ -52,6 +56,9 @@ class HardwareSyncDualCamera:
             homography_file: Homography matrix file
             correct_camera1_to_camera0: If True, correct camera 1 to match camera 0 (typical)
                                       If False, correct camera 0 to match camera 1
+            auto_calibrate: If True, automatically calibrate homography if file not found
+            calibration_frames: Number of frames to capture for auto-calibration
+            calibration_first_frame: Index of first frame to use for calibration calculation
         """
         self.width = width
         self.height = height
@@ -61,11 +68,16 @@ class HardwareSyncDualCamera:
         self.flip_camera1 = flip_camera1
         self.enable_homography = enable_homography
         self.correct_camera1_to_camera0 = correct_camera1_to_camera0
+        self.auto_calibrate = auto_calibrate
+        self.calibration_frames = calibration_frames
+        self.calibration_first_frame = calibration_first_frame
+        self.homography_file = homography_file
         
         # Homography support
         self.homography_matrix: Optional[np.ndarray] = None
         self.calibration_manager: Optional[CalibrationFileManager] = None
         self.homography_loaded = False
+        self.calibration_needed = False
         
         # Initialize homography if enabled
         if self.enable_homography:
@@ -122,6 +134,7 @@ class HardwareSyncDualCamera:
     def _initialize_homography(self, homography_file: str):
         """
         Initialize homography correction by loading calibration matrices
+        or setting up for auto-calibration
         
         Args:
             homography_file: Path to the homography calibration file
@@ -132,6 +145,7 @@ class HardwareSyncDualCamera:
             
             if self.homography_matrix is not None:
                 self.homography_loaded = True
+                self.calibration_needed = False
                 self.logger.info("✅ Homography matrix loaded successfully")
                 self.logger.info(f"   Matrix shape: {self.homography_matrix.shape}")
                 
@@ -139,6 +153,7 @@ class HardwareSyncDualCamera:
                 if self.homography_matrix.shape != (3, 3):
                     self.logger.error("❌ Invalid homography matrix shape")
                     self.homography_loaded = False
+                    self.calibration_needed = self.auto_calibrate
                     return
                 
                 # Check for reasonable values
@@ -146,17 +161,25 @@ class HardwareSyncDualCamera:
                 if abs(det) < 1e-10:
                     self.logger.error("❌ Homography matrix appears to be singular")
                     self.homography_loaded = False
+                    self.calibration_needed = self.auto_calibrate
                     return
                     
                 self.logger.info(f"   Matrix determinant: {det:.6f}")
                 
             else:
-                self.logger.warning("⚠️  No homography matrix found - alignment disabled")
+                self.logger.warning("⚠️  No homography matrix found")
                 self.homography_loaded = False
+                self.calibration_needed = self.auto_calibrate
+                
+                if self.auto_calibrate:
+                    self.logger.info("🔧 Auto-calibration enabled - will calibrate on first capture")
+                else:
+                    self.logger.warning("❌ Auto-calibration disabled - alignment will be unavailable")
                 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize homography: {e}")
             self.homography_loaded = False
+            self.calibration_needed = self.auto_calibrate
     
     def _apply_homography_correction(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -187,6 +210,106 @@ class HardwareSyncDualCamera:
             self.stats['homography_failures'] += 1
             self.logger.error(f"❌ Error applying homography: {e}")
             return frame
+    
+    def _perform_auto_calibration(self) -> bool:
+        """
+        Perform automatic homography calibration by capturing frames
+        
+        Returns:
+            True if calibration successful, False otherwise
+        """
+        if not self.calibration_needed:
+            return True
+            
+        self.logger.info("🔧 Starting automatic homography calibration...")
+        self.logger.info(f"   Capturing {self.calibration_frames} frames for calibration")
+        
+        try:
+            # Temporarily start capture without homography correction
+            original_homography_loaded = self.homography_loaded
+            self.homography_loaded = False  # Disable correction during calibration
+            
+            # Open video streams from named pipes for calibration
+            server_cap = cv2.VideoCapture(self.server_fifo)
+            client_cap = cv2.VideoCapture(self.client_fifo)
+            
+            if not server_cap.isOpened() or not client_cap.isOpened():
+                self.logger.error("❌ Failed to open video streams for calibration")
+                return False
+            
+            camera0_frames = []
+            camera1_frames = []
+            
+            # Capture calibration frames
+            for i in range(self.calibration_frames):
+                ret_server, frame_server = server_cap.read()
+                ret_client, frame_client = client_cap.read()
+                
+                if not ret_server or not ret_client:
+                    self.logger.error(f"❌ Failed to capture calibration frame {i+1}")
+                    server_cap.release()
+                    client_cap.release()
+                    return False
+                
+                # Apply horizontal flip to camera 1 if enabled (before calibration)
+                if self.flip_camera1:
+                    frame_client = cv2.flip(frame_client, 1)
+                
+                camera0_frames.append(frame_server)
+                camera1_frames.append(frame_client)
+                
+                self.logger.info(f"   📸 Captured calibration frame {i+1}/{self.calibration_frames}")
+                
+                # Small delay between captures
+                time.sleep(0.1)
+            
+            server_cap.release()
+            client_cap.release()
+            
+            self.logger.info("🔧 Calculating homography matrix...")
+            
+            # Calculate homography using the module function
+            if self.correct_camera1_to_camera0:
+                # Calculate homography to transform camera 1 to camera 0
+                homography_matrix = calculate_homography_from_frames(
+                    camera1_frames,  # Source frames (to be transformed)
+                    camera0_frames,  # Target frames (reference)
+                    calibration_frames=self.calibration_frames,
+                    first_calibration_frame=self.calibration_first_frame
+                )
+            else:
+                # Calculate homography to transform camera 0 to camera 1
+                homography_matrix = calculate_homography_from_frames(
+                    camera0_frames,  # Source frames (to be transformed)
+                    camera1_frames,  # Target frames (reference)
+                    calibration_frames=self.calibration_frames,
+                    first_calibration_frame=self.calibration_first_frame
+                )
+            
+            if homography_matrix is not None:
+                # Save the calculated homography
+                if self.calibration_manager.save_homography_matrix(homography_matrix):
+                    self.homography_matrix = homography_matrix
+                    self.homography_loaded = True
+                    self.calibration_needed = False
+                    
+                    self.logger.info("✅ Auto-calibration successful!")
+                    self.logger.info(f"   Homography matrix saved to: {self.homography_file}")
+                    self.logger.info(f"   Matrix determinant: {np.linalg.det(homography_matrix):.6f}")
+                    return True
+                else:
+                    self.logger.error("❌ Failed to save calibrated homography matrix")
+                    return False
+            else:
+                self.logger.error("❌ Auto-calibration failed - could not calculate homography")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error during auto-calibration: {e}")
+            return False
+        finally:
+            # Restore original homography state
+            self.homography_loaded = original_homography_loaded
     
     def _build_camera_command(self, camera_id: int, is_server: bool, output_path: str) -> list:
         """
@@ -259,6 +382,16 @@ class HardwareSyncDualCamera:
                 self.client_process.poll() is not None):
                 self.logger.error("One or both camera processes failed to start")
                 return False
+            
+            # Perform auto-calibration if needed
+            if self.calibration_needed:
+                self.logger.info("🔧 Performing automatic homography calibration...")
+                if not self._perform_auto_calibration():
+                    self.logger.error("❌ Auto-calibration failed")
+                    if not self.auto_calibrate:
+                        return False
+                    else:
+                        self.logger.warning("⚠️  Continuing without homography correction")
             
             # Start capture thread
             self.capture_thread = threading.Thread(target=self._capture_synchronized_frames, daemon=True)
@@ -415,6 +548,8 @@ class HardwareSyncDualCamera:
         stats.update({
             'homography_enabled': self.enable_homography,
             'homography_loaded': self.homography_loaded,
+            'auto_calibrate_enabled': self.auto_calibrate,
+            'calibration_needed': self.calibration_needed,
             'flip_camera1_enabled': self.flip_camera1
         })
         return stats
@@ -430,9 +565,13 @@ class HardwareSyncDualCamera:
             'homography_enabled': self.enable_homography,
             'homography_loaded': self.homography_loaded,
             'homography_matrix_available': self.homography_matrix is not None,
+            'auto_calibrate_enabled': self.auto_calibrate,
+            'calibration_needed': self.calibration_needed,
             'correct_camera1_to_camera0': self.correct_camera1_to_camera0,
             'corrected_camera': 1 if self.correct_camera1_to_camera0 else 0,
             'reference_camera': 0 if self.correct_camera1_to_camera0 else 1,
+            'calibration_frames': self.calibration_frames,
+            'calibration_first_frame': self.calibration_first_frame,
             'corrections_applied': self.stats.get('homography_corrections', 0),
             'correction_failures': self.stats.get('homography_failures', 0)
         }
@@ -499,7 +638,10 @@ def main():
         flip_camera1=True,  # Flip camera 1 frames horizontally
         enable_homography=True,  # Enable homography correction
         homography_file="wallCalibration_image_1080.pickle",
-        correct_camera1_to_camera0=True  # Correct camera 1 to match camera 0
+        correct_camera1_to_camera0=True,  # Correct camera 1 to match camera 0
+        auto_calibrate=True,  # Enable auto-calibration if no homography file
+        calibration_frames=15,  # Number of frames for calibration
+        calibration_first_frame=7  # First frame to use for calculation
     )
     
     try:
@@ -514,6 +656,10 @@ def main():
             corrected_cam = homography_status['corrected_camera']
             reference_cam = homography_status['reference_camera']
             print(f"   🎯 Camera {corrected_cam} will be corrected to match Camera {reference_cam}")
+        elif homography_status['auto_calibrate_enabled'] and homography_status['calibration_needed']:
+            print(f"   🔧 Auto-calibration will be performed using {homography_status['calibration_frames']} frames")
+        else:
+            print(f"   ⚠️  No homography correction will be applied")
         
         if not capture.start_capture():
             print("❌ Failed to start hardware synchronized capture")

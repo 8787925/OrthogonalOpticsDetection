@@ -75,7 +75,10 @@ def main():
         flip_camera1=True,
         enable_homography=True,
         homography_file="wallCalibration_image_1080.pickle",
-        correct_camera1_to_camera0=True  # Correct camera 1 to match camera 0
+        correct_camera1_to_camera0=True,  # Correct camera 1 to match camera 0
+        auto_calibrate=True,  # Enable auto-calibration
+        calibration_frames=12,  # Frames for auto-calibration
+        calibration_first_frame=5  # First frame to use for calculation
     )
     
     try:
@@ -90,10 +93,12 @@ def main():
             corrected_cam = homography_status['corrected_camera']
             reference_cam = homography_status['reference_camera']
             print(f"\n🎯 Camera {corrected_cam} will be aligned to match Camera {reference_cam} (reference)")
+        elif homography_status['calibration_needed'] and homography_status['auto_calibrate_enabled']:
+            print(f"\n🔧 Auto-calibration will be performed using {homography_status['calibration_frames']} frames")
+            print(f"   Starting from frame {homography_status['calibration_first_frame']} for calculation")
         
-        if not homography_status['homography_loaded']:
-            print("\n⚠️  WARNING: Homography correction not available!")
-            print("   Make sure 'wallCalibration_image_1080.pickle' exists and is valid")
+        if not homography_status['homography_loaded'] and not homography_status['auto_calibrate_enabled']:
+            print("\n⚠️  WARNING: No homography correction available and auto-calibration disabled!")
             response = input("   Continue without homography correction? (y/N): ")
             if response.lower() != 'y':
                 return

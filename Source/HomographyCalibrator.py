@@ -25,7 +25,7 @@ class HomographyCalibrator:
     
     def __init__(self, 
                  calibration_frames: int = 15,
-                 first_calibration_frame: int = 7,
+                 first_calibration_frame: int = 1,
                  debug_output: bool = True):
         """
         Initialize the homography calibrator
