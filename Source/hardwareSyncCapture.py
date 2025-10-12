@@ -34,7 +34,7 @@ class HardwareSyncDualCamera:
                  height: int = 1080,
                  framerate: int = 30,
                  bitrate: int = 10000000,
-                 buffer_size: int = 10,
+                 buffer_size: int = 80,
                  flip_camera0: bool = True,
                  enable_homography: bool = True,
                  homography_file: str = "wallCalibration_image_1080.pickle",
@@ -45,7 +45,8 @@ class HardwareSyncDualCamera:
                  debug_mode: bool = False,
                  debug_frame_limit: int = 30,
                  save_output: bool = False,
-                 output_directory: str = "captured_frames"):
+                 output_directory: str = "captured_frames",
+                 simple_output: bool = True):
         """
         Initialize hardware synchronized capture
         
@@ -67,6 +68,7 @@ class HardwareSyncDualCamera:
             debug_frame_limit: Number of frames to capture in debug mode (default 30)
             save_output: If True, save captured frames to disk
             output_directory: Directory to save captured frames (default: "captured_frames")
+            simple_output: If True, use simplified status output (frame count only on 10th interval)
         """
         self.width = width
         self.height = height
@@ -84,6 +86,7 @@ class HardwareSyncDualCamera:
         self.debug_frame_limit = debug_frame_limit
         self.save_output = save_output
         self.output_directory = output_directory
+        self.simple_output = simple_output
         
         # Setup logging early - needed for all subsequent operations
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -93,6 +96,9 @@ class HardwareSyncDualCamera:
         if self.save_output:
             os.makedirs(self.output_directory, exist_ok=True)
             self.logger.info(f"Output directory created: {self.output_directory}")
+        
+        # Frame storage for batch saving
+        self.accumulated_frames = []
         
         # Debug mode tracking
         self.debug_frames_captured = 0
@@ -138,7 +144,13 @@ class HardwareSyncDualCamera:
             'synchronized_pairs': 0,
             'dropped_frames': 0,
             'homography_corrections': 0,
-            'homography_failures': 0
+            'homography_failures': 0,
+            'loop_times': [],  # List to store individual loop execution times
+            'total_loop_time': 0.0,  # Cumulative time spent in capture loop
+            'avg_loop_time': 0.0,  # Average loop execution time
+            'min_loop_time': float('inf'),  # Minimum loop time recorded
+            'max_loop_time': 0.0,  # Maximum loop time recorded
+            'loop_count': 0  # Total number of loops executed
         }
         
         # Register cleanup
@@ -147,7 +159,7 @@ class HardwareSyncDualCamera:
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
-        self.logger.info("Shutting down...")
+        self.logger.info("Shutdown signal received...")
         self.stop_capture()
         sys.exit(0)
     
@@ -233,7 +245,7 @@ class HardwareSyncDualCamera:
     
     def _save_frame_pair(self, frame_pair: dict, frame_number: int):
         """
-        Save synchronized frame pair to disk
+        Accumulate synchronized frame pair in memory for later batch saving
         
         Args:
             frame_pair: Dictionary containing frame data
@@ -243,38 +255,92 @@ class HardwareSyncDualCamera:
             # Generate timestamp for unique filenames
             timestamp = int(time.time() * 1000)  # milliseconds
             
-            # Save camera 0 frame
-            frame0_filename = f"camera0_frame_{frame_number:06d}_{timestamp}.jpg"
-            frame0_path = os.path.join(self.output_directory, frame0_filename)
-            cv2.imwrite(frame0_path, frame_pair['frame0'])
+            # Store frame data in memory for batch saving later
+            frame_data = {
+                'frame_number': frame_number,
+                'timestamp': timestamp,
+                'frame0': frame_pair['frame0'].copy(),  # Make a copy to avoid reference issues
+                'frame1': frame_pair['frame1'].copy(),  # Make a copy to avoid reference issues
+                'metadata': {
+                    'Frame Number': frame_number,
+                    'Timestamp': frame_pair['timestamp'],
+                    'Hardware Synced': frame_pair['hardware_synced'],
+                    'Homography Corrected': frame_pair['homography_corrected'],
+                    'Corrected Camera': frame_pair.get('corrected_camera', 'None'),
+                    'Debug Mode': frame_pair.get('debug_mode', False),
+                    'Debug Frame Number': frame_pair.get('debug_frame_number', 'N/A') if frame_pair.get('debug_mode') else 'N/A'
+                }
+            }
             
-            # Save camera 1 frame  
-            frame1_filename = f"camera1_frame_{frame_number:06d}_{timestamp}.jpg"
-            frame1_path = os.path.join(self.output_directory, frame1_filename)
-            cv2.imwrite(frame1_path, frame_pair['frame1'])
+            self.accumulated_frames.append(frame_data)
             
-            # Save metadata as text file
-            metadata_filename = f"metadata_frame_{frame_number:06d}_{timestamp}.txt"
-            metadata_path = os.path.join(self.output_directory, metadata_filename)
-            
-            with open(metadata_path, 'w') as f:
-                f.write(f"Frame Number: {frame_number}\n")
-                f.write(f"Timestamp: {frame_pair['timestamp']}\n")
-                f.write(f"Hardware Synced: {frame_pair['hardware_synced']}\n")
-                f.write(f"Homography Corrected: {frame_pair['homography_corrected']}\n")
-                f.write(f"Corrected Camera: {frame_pair.get('corrected_camera', 'None')}\n")
-                f.write(f"Debug Mode: {frame_pair.get('debug_mode', False)}\n")
-                if frame_pair.get('debug_mode'):
-                    f.write(f"Debug Frame Number: {frame_pair.get('debug_frame_number', 'N/A')}\n")
-                f.write(f"Camera 0 File: {frame0_filename}\n")
-                f.write(f"Camera 1 File: {frame1_filename}\n")
-            
-            # Log every 10th frame to avoid spam
+            # Log every 10th frame to show progress
             if frame_number % 10 == 0:
-                self.logger.info(f"📁 Saved frame pair {frame_number} to {self.output_directory}")
+                self.logger.info(f"📁 Accumulated frame pair {frame_number} in memory ({len(self.accumulated_frames)} total)")
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to save frame pair {frame_number}: {e}")
+            self.logger.error(f"❌ Failed to accumulate frame pair {frame_number}: {e}")
+
+    def _save_accumulated_frames_to_disk(self):
+        """
+        Save all accumulated frames to disk in batch
+        """
+        if not self.save_output or not self.accumulated_frames:
+            return
+            
+        self.logger.info(f"💾 Saving {len(self.accumulated_frames)} accumulated frames to disk...")
+        
+        saved_count = 0
+        failed_count = 0
+        
+        for frame_data in self.accumulated_frames:
+            try:
+                frame_number = frame_data['frame_number']
+                timestamp = frame_data['timestamp']
+                
+                # Save camera 0 frame
+                frame0_filename = f"camera0_frame_{frame_number:06d}_{timestamp}.jpg"
+                frame0_path = os.path.join(self.output_directory, frame0_filename)
+                cv2.imwrite(frame0_path, frame_data['frame0'])
+                
+                # Save camera 1 frame  
+                frame1_filename = f"camera1_frame_{frame_number:06d}_{timestamp}.jpg"
+                frame1_path = os.path.join(self.output_directory, frame1_filename)
+                cv2.imwrite(frame1_path, frame_data['frame1'])
+                
+                # Save metadata as text file
+                metadata_filename = f"metadata_frame_{frame_number:06d}_{timestamp}.txt"
+                metadata_path = os.path.join(self.output_directory, metadata_filename)
+                
+                with open(metadata_path, 'w') as f:
+                    for key, value in frame_data['metadata'].items():
+                        f.write(f"{key}: {value}\n")
+                    f.write(f"Camera 0 File: {frame0_filename}\n")
+                    f.write(f"Camera 1 File: {frame1_filename}\n")
+                
+                saved_count += 1
+                
+                # Show progress every 50 saves
+                if saved_count % 50 == 0:
+                    self.logger.info(f"� Saved {saved_count}/{len(self.accumulated_frames)} frames...")
+                    
+            except Exception as e:
+                failed_count += 1
+                self.logger.error(f"❌ Failed to save frame {frame_data['frame_number']}: {e}")
+        
+        self.logger.info(f"✅ Batch save completed: {saved_count} saved, {failed_count} failed")
+        
+        # Clear accumulated frames to free memory
+        self.accumulated_frames.clear()
+
+    def save_frames_now(self):
+        """
+        Manually trigger saving of accumulated frames to disk
+        Useful for periodic saves during long captures
+        """
+        if self.save_output and self.accumulated_frames:
+            self.logger.info(f"🔄 Manual save triggered for {len(self.accumulated_frames)} frames")
+            self._save_accumulated_frames_to_disk()
 
     def _perform_auto_calibration(self) -> bool:
         """
@@ -493,6 +559,9 @@ class HardwareSyncDualCamera:
             self.logger.info("Video streams opened successfully")
             
             while self.running:
+                # Start timing the loop iteration
+                loop_start_time = time.time()
+                
                 # Read frames from both cameras
                 # Since they're hardware synchronized, we can read them sequentially
                 
@@ -527,8 +596,7 @@ class HardwareSyncDualCamera:
                 self.stats['client_frames'] += 1
                 
                 # Update debug mode counter
-                if self.debug_mode:
-                    self.debug_frames_captured += 1
+                self.debug_frames_captured += 1
                 
                 # Create synchronized frame pair with one camera corrected
                 timestamp = time.time() * 1000
@@ -560,6 +628,22 @@ class HardwareSyncDualCamera:
                         self.stats['dropped_frames'] += 1
                     except:
                         pass
+                
+                # Calculate and record loop timing statistics
+                loop_end_time = time.time()
+                loop_duration = loop_end_time - loop_start_time
+                
+                # Update timing statistics
+                self.stats['loop_times'].append(loop_duration)
+                self.stats['total_loop_time'] += loop_duration
+                self.stats['loop_count'] += 1
+                self.stats['avg_loop_time'] = self.stats['total_loop_time'] / self.stats['loop_count']
+                self.stats['min_loop_time'] = min(self.stats['min_loop_time'], loop_duration)
+                self.stats['max_loop_time'] = max(self.stats['max_loop_time'], loop_duration)
+                
+                # Keep only the last 1000 loop times to prevent memory growth
+                if len(self.stats['loop_times']) > 1000:
+                    self.stats['loop_times'].pop(0)
                 
                 # Check for debug mode completion
                 if self.debug_mode and self.debug_frames_captured >= self.debug_frame_limit:
@@ -596,6 +680,11 @@ class HardwareSyncDualCamera:
         """Stop synchronized capture"""
         self.logger.info("Stopping capture...")
         self.running = False
+        
+        # Save accumulated frames to disk before cleanup
+        if self.save_output and self.accumulated_frames:
+            self.logger.info("💾 Saving accumulated frames before shutdown...")
+            self._save_accumulated_frames_to_disk()
         
         # Stop processes
         for process in [self.server_process, self.client_process]:
@@ -634,9 +723,52 @@ class HardwareSyncDualCamera:
             'flip_camera0_enabled': self.flip_camera0,
             'debug_mode': self.debug_mode,
             'debug_frames_captured': self.debug_frames_captured if self.debug_mode else None,
-            'debug_frame_limit': self.debug_frame_limit if self.debug_mode else None
+            'debug_frame_limit': self.debug_frame_limit if self.debug_mode else None,
+            'accumulated_frames_count': len(self.accumulated_frames) if self.save_output else None,
+            'simple_output': self.simple_output,
+            'avg_loop_time_ms': self.stats['avg_loop_time'] * 1000 if self.stats['loop_count'] > 0 else 0.0,
+            'loop_count': self.stats['loop_count']
         })
         return stats
+    
+    def get_timing_stats(self) -> dict:
+        """
+        Get detailed timing statistics for capture loop performance
+        
+        Returns:
+            Dictionary with timing analysis including averages, min/max, and recent performance
+        """
+        if self.stats['loop_count'] == 0:
+            return {
+                'loop_count': 0,
+                'avg_loop_time_ms': 0.0,
+                'min_loop_time_ms': 0.0,
+                'max_loop_time_ms': 0.0,
+                'total_loop_time_s': 0.0,
+                'recent_avg_loop_time_ms': 0.0,
+                'theoretical_max_fps': 0.0,
+                'actual_fps_estimate': 0.0
+            }
+        
+        # Calculate recent average (last 100 loops or all if fewer)
+        recent_times = self.stats['loop_times'][-100:] if len(self.stats['loop_times']) > 100 else self.stats['loop_times']
+        recent_avg = sum(recent_times) / len(recent_times) if recent_times else 0.0
+        
+        # Estimate actual FPS based on average loop time
+        avg_time = self.stats['avg_loop_time']
+        actual_fps = 1.0 / avg_time if avg_time > 0 else 0.0
+        theoretical_max_fps = 1.0 / self.stats['min_loop_time'] if self.stats['min_loop_time'] != float('inf') else 0.0
+        
+        return {
+            'loop_count': self.stats['loop_count'],
+            'avg_loop_time_ms': self.stats['avg_loop_time'] * 1000,
+            'min_loop_time_ms': self.stats['min_loop_time'] * 1000 if self.stats['min_loop_time'] != float('inf') else 0.0,
+            'max_loop_time_ms': self.stats['max_loop_time'] * 1000,
+            'total_loop_time_s': self.stats['total_loop_time'],
+            'recent_avg_loop_time_ms': recent_avg * 1000,
+            'theoretical_max_fps': theoretical_max_fps,
+            'actual_fps_estimate': actual_fps
+        }
     
     def get_homography_status(self) -> dict:
         """
@@ -719,14 +851,15 @@ def main():
         height=1080,
         framerate=15,  # Start with lower framerate
         bitrate=8000000,  # 8 Mbps for 1080p
-        flip_camera0=True,  # Flip camera 0 frames horizontally
-        enable_homography=True,  # Enable homography correction
+        flip_camera0=False,  # Flip camera 0 frames horizontally
+        enable_homography=False,  # Enable homography correction
         homography_file="wallCalibration_image_1080.pickle",
         correct_camera1_to_camera0=True,  # Correct camera 1 to match camera 0
         auto_calibrate=True,  # Enable auto-calibration if no homography file
         calibration_frames=15,  # Number of frames for calibration
         calibration_first_frame=1,  # First frame to use for calculation
-        save_output=True
+        save_output=True,
+        simple_output=True  # Set to True for simplified status output
     )
     
     try:
@@ -762,7 +895,7 @@ def main():
         
         while True:
             # Get hardware synchronized frames (now with single-camera homography correction)
-            frame_pair = capture.get_synchronized_frames(timeout=2.0)
+            frame_pair = capture.get_synchronized_frames(timeout=0.1)
             
             if frame_pair is None:
                 print("⚠️  No synchronized frames available")
@@ -771,33 +904,42 @@ def main():
             frame_count += 1
             
             # Perform difference analysis on aligned frames
-            analysis = frame_difference_analysis(
-                frame_pair['frame0'],  # Camera 0 (reference or corrected) + flipped
-                frame_pair['frame1']   # Camera 1 (corrected or reference)
-            )
+            #analysis = frame_difference_analysis(
+            #    frame_pair['frame0'],  # Camera 0 (reference or corrected) + flipped
+            #    frame_pair['frame1']   # Camera 1 (corrected or reference)
+            #)
             
             # Print results
             if frame_count % 10 == 0:
-                corrected_camera = frame_pair.get('corrected_camera', 'None')
-                print(f"\n📊 Frame {frame_count} (Hardware Synced + Camera {corrected_camera} Corrected):")
-                print(f"   📊 Mean diff: {analysis['mean_difference']:.2f}")
-                print(f"   🎯 Diff area: {analysis['difference_percentage']:.2f}%")
-                print(f"   📍 Regions: {analysis['num_difference_regions']}")
-                print(f"   🔧 Homography: {'✅' if frame_pair.get('homography_corrected', False) else '❌'}")
+                if capture.simple_output:
+                    # Simplified output: just frame count
+                    print(f"Frame {frame_count}")
+                else:
+                    # Detailed output: full status information
+                    corrected_camera = frame_pair.get('corrected_camera', 'None')
+                    print(f"\n📊 Frame {frame_count} (Hardware Synced + Camera {corrected_camera} Corrected):")
+                    print(f"   📊 Mean diff: {analysis['mean_difference']:.2f}")
+                    print(f"   🎯 Diff area: {analysis['difference_percentage']:.2f}%")
+                    print(f"   📍 Regions: {analysis['num_difference_regions']}")
+                    print(f"   🔧 Homography: {'✅' if frame_pair.get('homography_corrected', False) else '❌'}")
+                    
+                    # Statistics including homography and timing
+                    stats = capture.get_stats()
+                    timing_stats = capture.get_timing_stats()
+                    print(f"   📈 Total pairs: {stats['synchronized_pairs']}")
+                    print(f"   🎯 Homography corrections: {stats['homography_corrections']}")
+                    print(f"   ❌ Dropped: {stats['dropped_frames']}")
+                    print(f"   ⚠️  Homography failures: {stats['homography_failures']}")
+                    print(f"   ⏱️  Avg loop time: {timing_stats['avg_loop_time_ms']:.2f}ms")
+                    print(f"   ⚡ Est. FPS: {timing_stats['actual_fps_estimate']:.1f}")
+            
+            # Status indicator (only for detailed output)
+            if not capture.simple_output:
+                status = "🔴" if analysis['difference_percentage'] > 1.0 else "🟢"
+                print(f"{status}", end="", flush=True)
                 
-                # Statistics including homography
-                stats = capture.get_stats()
-                print(f"   📈 Total pairs: {stats['synchronized_pairs']}")
-                print(f"   🎯 Homography corrections: {stats['homography_corrections']}")
-                print(f"   ❌ Dropped: {stats['dropped_frames']}")
-                print(f"   ⚠️  Homography failures: {stats['homography_failures']}")
-            
-            # Status indicator
-            status = "🔴" if analysis['difference_percentage'] > 1.0 else "🟢"
-            print(f"{status}", end="", flush=True)
-            
-            if frame_count % 50 == 0:
-                print()  # New line
+                if frame_count % 50 == 0:
+                    print()  # New line
     
     except KeyboardInterrupt:
         print("\n🛑 Stopping...")
@@ -828,7 +970,8 @@ def debug_mode_example():
         debug_mode=True,  # Enable debug mode
         debug_frame_limit=30,  # Capture only 30 frames
         save_output=True,  # Save frames to disk
-        output_directory="debug_capture_frames"  # Save to this directory
+        output_directory="debug_capture_frames",  # Save to this directory
+        simple_output=True  # Use simplified output for debug mode
     )
     
     try:
@@ -840,6 +983,7 @@ def debug_mode_example():
         print(f"   🎥 Resolution: {capture.width}x{capture.height}")
         print(f"   📸 Framerate: {capture.framerate} fps")
         print(f"   💾 Save Output: {'✅' if capture.save_output else '❌'}")
+        print(f"   📄 Simple Output: {'✅' if capture.simple_output else '❌'}")
         if capture.save_output:
             print(f"   📁 Output Directory: {capture.output_directory}")
         
@@ -876,9 +1020,12 @@ def debug_mode_example():
         print(f"   🔧 Homography applied: {'✅' if final_stats['homography_loaded'] else '❌'}")
         
         if capture.save_output:
+            accumulated_count = final_stats.get('accumulated_frames_count', 0)
             total_files = final_stats['debug_frames_captured'] * 3  # 2 images + 1 metadata per frame
-            print(f"   💾 Files saved: {total_files} ({final_stats['debug_frames_captured']} frame pairs)")
-            print(f"   📁 Location: {capture.output_directory}")
+            print(f"   💾 Frames in memory: {accumulated_count}")
+            print(f"   💾 Total files to save: {total_files} ({final_stats['debug_frames_captured']} frame pairs)")
+            print(f"   📁 Will be saved to: {capture.output_directory}")
+            print(f"   ⏳ Files will be written to disk during shutdown...")
         
     except KeyboardInterrupt:
         print("\n🛑 Debug stopped by user")
@@ -893,5 +1040,109 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1 and sys.argv[1] == "--debug":
         debug_mode_example()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--timing":
+        # Timing statistics demo
+        print("⏱️  Timing Statistics Demo - Monitor capture loop performance")
+        
+        capture = HardwareSyncDualCamera(
+            width=1920,
+            height=1080,
+            framerate=15,
+            bitrate=4000000,
+            flip_camera0=False,
+            enable_homography=False,
+            homography_file="wallCalibration_image_1080.pickle",
+            correct_camera1_to_camera0=False,
+            auto_calibrate=False,
+            save_output=True,
+            output_directory="timing_capture_frames",
+            simple_output=False  # Show detailed timing info
+        )
+        
+        try:
+            if not capture.start_capture():
+                print("❌ Failed to start capture")
+                sys.exit(1)
+            
+            print("✅ Capture started - Collecting timing statistics...")
+            print("Press Ctrl+C to stop and see detailed timing analysis\n")
+            
+            frame_count = 0
+            while True:
+                frame_pair = capture.get_synchronized_frames(timeout=2.0)
+                if frame_pair is None:
+                    continue
+                    
+                frame_count += 1
+                
+                # Show timing stats every 50 frames
+                if frame_count % 50 == 0:
+                    timing_stats = capture.get_timing_stats()
+                    print(f"\n⏱️  Timing Statistics (Frame {frame_count}):")
+                    print(f"   🔄 Loop count: {timing_stats['loop_count']}")
+                    print(f"   📊 Avg loop time: {timing_stats['avg_loop_time_ms']:.2f}ms")
+                    print(f"   🚀 Min loop time: {timing_stats['min_loop_time_ms']:.2f}ms")
+                    print(f"   🐌 Max loop time: {timing_stats['max_loop_time_ms']:.2f}ms")
+                    print(f"   ⚡ Recent avg: {timing_stats['recent_avg_loop_time_ms']:.2f}ms")
+                    print(f"   🎯 Est. FPS: {timing_stats['actual_fps_estimate']:.1f}")
+                    print(f"   🏆 Max possible FPS: {timing_stats['theoretical_max_fps']:.1f}")
+                    
+        except KeyboardInterrupt:
+            print("\n🛑 Final Timing Analysis:")
+            final_timing = capture.get_timing_stats()
+            print(f"   📈 Total loops executed: {final_timing['loop_count']}")
+            print(f"   ⏱️  Total capture time: {final_timing['total_loop_time_s']:.2f}s")
+            print(f"   📊 Average loop time: {final_timing['avg_loop_time_ms']:.2f}ms")
+            print(f"   🚀 Fastest loop: {final_timing['min_loop_time_ms']:.2f}ms")
+            print(f"   🐌 Slowest loop: {final_timing['max_loop_time_ms']:.2f}ms")
+            print(f"   ⚡ Estimated FPS: {final_timing['actual_fps_estimate']:.1f}")
+        finally:
+            capture.stop_capture()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--simple":
+        # Simple output mode example
+        print("🔄 Simple Output Mode - Minimal status display")
+        
+        # Create capture with simple output enabled
+        capture = HardwareSyncDualCamera(
+            width=1920,
+            height=1080,
+            framerate=15,
+            bitrate=8000000,
+            flip_camera0=True,
+            enable_homography=True,
+            homography_file="wallCalibration_image_1080.pickle",
+            correct_camera1_to_camera0=True,
+            auto_calibrate=True,
+            calibration_frames=15,
+            calibration_first_frame=1,
+            save_output=False,
+            simple_output=True  # Enable simple output
+        )
+        
+        try:
+            print("Starting simple capture...")
+            if not capture.start_capture():
+                print("❌ Failed to start capture")
+                sys.exit(1)
+            
+            print("✅ Capture started - Simple mode (frame count every 10 frames)")
+            print("Press Ctrl+C to stop\n")
+            
+            frame_count = 0
+            while True:
+                frame_pair = capture.get_synchronized_frames(timeout=2.0)
+                if frame_pair is None:
+                    continue
+                frame_count += 1
+                
+                # Simple output will show just "Frame X" every 10 frames
+                if frame_count % 10 == 0:
+                    if capture.simple_output:
+                        print(f"Frame {frame_count}")
+                        
+        except KeyboardInterrupt:
+            print("\n🛑 Stopping...")
+        finally:
+            capture.stop_capture()
     else:
         main()
