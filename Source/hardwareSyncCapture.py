@@ -113,8 +113,8 @@ class HardwareSyncDualCamera:
         if self.enable_homography:
             self._initialize_homography(homography_file)
         
-        # Temporary files for H.264 streams
-        self.temp_dir = tempfile.mkdtemp(prefix="sync_cameras_")
+        # Temporary files for H.264 streams - prefer RAM-based storage
+        self.temp_dir = self._create_ram_temp_dir(prefix="sync_cameras_")
         self.server_fifo = os.path.join(self.temp_dir, "server_stream")
         self.client_fifo = os.path.join(self.temp_dir, "client_stream")
         
@@ -153,9 +153,209 @@ class HardwareSyncDualCamera:
             'loop_count': 0  # Total number of loops executed
         }
         
+        # RAM disk management
+        self._ram_disk_mount: Optional[str] = None
+        
         # Register cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _create_ram_temp_dir(self, prefix: str = "sync_cameras_") -> str:
+        """
+        Create a temporary directory preferring RAM-based storage when available
+        First tries to create/use a dedicated RAM disk, then falls back to shared RAM
+        
+        Args:
+            prefix: Prefix for the temporary directory name
+            
+        Returns:
+            Path to the created temporary directory
+        """
+        # Try to create or use a dedicated RAM disk first
+        ram_disk_path = self._setup_dedicated_ram_disk()
+        if ram_disk_path:
+            try:
+                temp_dir = tempfile.mkdtemp(prefix=prefix, dir=ram_disk_path)
+                self.logger.info(f"💾 Created temp directory on dedicated RAM disk: {temp_dir}")
+                return temp_dir
+            except (OSError, PermissionError) as e:
+                self.logger.warning(f"⚠️  Failed to use RAM disk {ram_disk_path}: {e}")
+        
+        # Try RAM-based temporary directories in order of preference
+        ram_paths = [
+            '/dev/shm',      # Shared memory filesystem (most Linux systems)
+            '/tmp',          # May be tmpfs on some systems
+            '/var/tmp'       # Fallback, usually disk-based but check anyway
+        ]
+        
+        for ram_path in ram_paths:
+            if os.path.exists(ram_path) and os.access(ram_path, os.W_OK):
+                try:
+                    # Check if this path is mounted as tmpfs (RAM-based)
+                    with open('/proc/mounts', 'r') as f:
+                        mounts = f.read()
+                        if f'tmpfs {ram_path}' in mounts or f'shm {ram_path}' in mounts:
+                            temp_dir = tempfile.mkdtemp(prefix=prefix, dir=ram_path)
+                            self.logger.info(f"📱 Created RAM-based temp directory: {temp_dir}")
+                            return temp_dir
+                except (IOError, OSError, PermissionError):
+                    continue
+        
+        # Fallback to default system temporary directory (likely disk-based)
+        temp_dir = tempfile.mkdtemp(prefix=prefix)
+        self.logger.warning(f"⚠️  No RAM-based storage found, using disk temp directory: {temp_dir}")
+        self.logger.info("💡 For better performance, consider mounting /tmp as tmpfs or using /dev/shm")
+        return temp_dir
+    
+    def _setup_dedicated_ram_disk(self, size_mb: int = 256) -> Optional[str]:
+        """
+        Setup a dedicated RAM disk for camera operations
+        
+        Args:
+            size_mb: Size of RAM disk in MB (default 256MB)
+            
+        Returns:
+            Path to RAM disk mount point if successful, None otherwise
+        """
+        mount_point = f"/tmp/camera_ramdisk_{os.getpid()}"
+        
+        try:
+            # Check if we already have a RAM disk mounted
+            with open('/proc/mounts', 'r') as f:
+                mounts = f.read()
+                if mount_point in mounts:
+                    self.logger.info(f"💾 Using existing RAM disk: {mount_point}")
+                    self._ram_disk_mount = mount_point
+                    return mount_point
+            
+            # Create mount point
+            os.makedirs(mount_point, exist_ok=True)
+            
+            # Try to mount tmpfs RAM disk
+            mount_cmd = [
+                'mount', '-t', 'tmpfs',
+                '-o', f'size={size_mb}M,mode=0755,uid={os.getuid()},gid={os.getgid()}',
+                'tmpfs', mount_point
+            ]
+            
+            # First try without sudo (might work if user has permissions)
+            try:
+                result = subprocess.run(mount_cmd, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    self.logger.info(f"💾 Created dedicated RAM disk: {mount_point} ({size_mb}MB)")
+                    self._ram_disk_mount = mount_point
+                    return mount_point
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+                pass
+            
+            # Try with sudo if available
+            if self._check_sudo_available():
+                sudo_cmd = ['sudo'] + mount_cmd
+                try:
+                    result = subprocess.run(sudo_cmd, capture_output=True, text=True, timeout=15)
+                    if result.returncode == 0:
+                        # Fix permissions after sudo mount
+                        subprocess.run(['sudo', 'chown', f"{os.getuid()}:{os.getgid()}", mount_point], 
+                                     capture_output=True, timeout=5)
+                        self.logger.info(f"💾 Created dedicated RAM disk with sudo: {mount_point} ({size_mb}MB)")
+                        self._ram_disk_mount = mount_point
+                        return mount_point
+                    else:
+                        self.logger.debug(f"Sudo mount failed: {result.stderr}")
+                except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+                    pass
+            
+            # Cleanup failed mount point
+            try:
+                os.rmdir(mount_point)
+            except OSError:
+                pass
+                
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to setup RAM disk: {e}")
+            return None
+    
+    def _check_sudo_available(self) -> bool:
+        """Check if sudo is available and configured"""
+        try:
+            result = subprocess.run(['sudo', '-n', 'true'], capture_output=True, timeout=5)
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+            return False
+    
+    def _cleanup_dedicated_ram_disk(self):
+        """Cleanup dedicated RAM disk if we created one"""
+        if hasattr(self, '_ram_disk_mount') and self._ram_disk_mount:
+            try:
+                # First try to unmount without sudo
+                result = subprocess.run(['umount', self._ram_disk_mount], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    self.logger.info(f"💾 Unmounted RAM disk: {self._ram_disk_mount}")
+                elif self._check_sudo_available():
+                    # Try with sudo
+                    result = subprocess.run(['sudo', 'umount', self._ram_disk_mount], 
+                                          capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        self.logger.info(f"💾 Unmounted RAM disk with sudo: {self._ram_disk_mount}")
+                
+                # Remove mount point directory
+                try:
+                    os.rmdir(self._ram_disk_mount)
+                except OSError:
+                    pass
+                    
+            except Exception as e:
+                self.logger.warning(f"⚠️  Failed to cleanup RAM disk {self._ram_disk_mount}: {e}")
+            finally:
+                self._ram_disk_mount = None
+    
+    def get_temp_storage_info(self) -> dict:
+        """
+        Get information about the temporary storage being used
+        
+        Returns:
+            Dictionary with storage type and performance characteristics
+        """
+        storage_info = {
+            'temp_dir': self.temp_dir,
+            'storage_type': 'disk',  # Default assumption
+            'is_ram_based': False,
+            'mount_info': None,
+            'dedicated_ram_disk': hasattr(self, '_ram_disk_mount') and self._ram_disk_mount is not None,
+            'ram_disk_mount': getattr(self, '_ram_disk_mount', None)
+        }
+        
+        try:
+            with open('/proc/mounts', 'r') as f:
+                mounts = f.read()
+                
+            # Check if temp directory is on a RAM-based filesystem
+            for line in mounts.split('\n'):
+                if not line.strip():
+                    continue
+                    
+                parts = line.split()
+                if len(parts) >= 3:
+                    fs_type, mount_point = parts[0], parts[1]
+                    
+                    if self.temp_dir.startswith(mount_point):
+                        storage_info['mount_info'] = line
+                        if 'tmpfs' in fs_type or 'shm' in fs_type:
+                            storage_info['storage_type'] = 'ram'
+                            storage_info['is_ram_based'] = True
+                            
+                        # Check if this is our dedicated RAM disk
+                        if mount_point == getattr(self, '_ram_disk_mount', None):
+                            storage_info['storage_type'] = 'dedicated_ram_disk'
+                        break
+                        
+        except (IOError, OSError):
+            storage_info['mount_info'] = 'Unable to read mount information'
+            
+        return storage_info
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
@@ -556,12 +756,17 @@ class HardwareSyncDualCamera:
                 self.logger.error("Failed to open client video stream")
                 return
             
+            # Configure buffer settings for minimal latency
+            #self._configure_capture_buffers()
+            
             self.logger.info("Video streams opened successfully")
+            
+            startLoop = 0
             
             while self.running:
                 # Start timing the loop iteration
                 loop_start_time = time.time()
-                
+                startLoop += 1
                 # Read frames from both cameras
                 # Since they're hardware synchronized, we can read them sequentially
                 
@@ -573,62 +778,65 @@ class HardwareSyncDualCamera:
                     if self.running:
                         self.logger.warning("Failed to read from one or both cameras")
                     break
-                
-                # Flip camera 0 (server) frame horizontally if requested
-                if self.flip_camera0:
-                    frame_server = cv2.flip(frame_server, 1)  # 1 = horizontal flip
-                
-                # Apply homography correction to only one camera if enabled
-                if self.enable_homography and self.homography_loaded:
-                    if self.correct_camera1_to_camera0:
-                        # Correct camera 1 to match camera 0's perspective (typical case)
-                        frame_client_corrected = self._apply_homography_correction(frame_client)
-                        frame_client = frame_client_corrected
-                        # Camera 0 remains as reference (uncorrected)
-                    else:
-                        # Correct camera 0 to match camera 1's perspective (less common)
-                        frame_server_corrected = self._apply_homography_correction(frame_server)
-                        frame_server = frame_server_corrected
-                        # Camera 1 remains as reference (uncorrected)
-                
-                # Update statistics
-                self.stats['server_frames'] += 1
-                self.stats['client_frames'] += 1
-                
-                # Update debug mode counter
-                self.debug_frames_captured += 1
-                
-                # Create synchronized frame pair with one camera corrected
-                timestamp = time.time() * 1000
-                corrected_camera = 1 if self.correct_camera1_to_camera0 else 0
-                frame_pair = {
-                    'frame0': frame_server,  # Server camera (camera 0) - flipped if enabled
-                    'frame1': frame_client,  # Client camera (camera 1)
-                    'timestamp': timestamp,
-                    'hardware_synced': True,
-                    'homography_corrected': self.enable_homography and self.homography_loaded,
-                    'corrected_camera': corrected_camera if (self.enable_homography and self.homography_loaded) else None,
-                    'debug_mode': self.debug_mode,
-                    'debug_frame_number': self.debug_frames_captured if self.debug_mode else None
-                }
-                
-                # Save frames to disk if enabled
-                if self.save_output:
-                    self._save_frame_pair(frame_pair, self.debug_frames_captured)
-                
-                # Add to queue
-                try:
-                    self.synchronized_queue.put_nowait(frame_pair)
-                    self.stats['synchronized_pairs'] += 1
-                except:
-                    # Queue full, drop oldest frame
+                if startLoop > 350:    
+                    # Flip camera 0 (server) frame horizontally if requested
+                    if self.flip_camera0:
+                        frame_server = cv2.flip(frame_server, 1)  # 1 = horizontal flip
+                    
+                    # Apply homography correction to only one camera if enabled
+                    if self.enable_homography and self.homography_loaded:
+                        if self.correct_camera1_to_camera0:
+                            # Correct camera 1 to match camera 0's perspective (typical case)
+                            frame_client_corrected = self._apply_homography_correction(frame_client)
+                            frame_client = frame_client_corrected
+                            # Camera 0 remains as reference (uncorrected)
+                        else:
+                            # Correct camera 0 to match camera 1's perspective (less common)
+                            frame_server_corrected = self._apply_homography_correction(frame_server)
+                            frame_server = frame_server_corrected
+                            # Camera 1 remains as reference (uncorrected)
+                    
+                    # Update statistics
+                    self.stats['server_frames'] += 1
+                    self.stats['client_frames'] += 1
+                    
+                    # Update debug mode counter
+                    self.debug_frames_captured += 1
+                    
+                    # Create synchronized frame pair with one camera corrected
+                    timestamp = time.time() * 1000
+                    corrected_camera = 1 if self.correct_camera1_to_camera0 else 0
+                    frame_pair = {
+                        'frame0': frame_server,  # Server camera (camera 0) - flipped if enabled
+                        'frame1': frame_client,  # Client camera (camera 1)
+                        'timestamp': timestamp,
+                        'hardware_synced': True,
+                        'homography_corrected': self.enable_homography and self.homography_loaded,
+                        'corrected_camera': corrected_camera if (self.enable_homography and self.homography_loaded) else None,
+                        'debug_mode': self.debug_mode,
+                        'debug_frame_number': self.debug_frames_captured if self.debug_mode else None
+                    }
+                    
+                    # Save frames to disk if enabled
+                    if self.save_output:
+                        self._save_frame_pair(frame_pair, self.debug_frames_captured)
+                    
+                    # Add to queue
                     try:
-                        self.synchronized_queue.get_nowait()
                         self.synchronized_queue.put_nowait(frame_pair)
-                        self.stats['dropped_frames'] += 1
+                        self.stats['synchronized_pairs'] += 1
                     except:
-                        pass
-                
+                        # Queue full, drop oldest frame
+                        try:
+                            self.synchronized_queue.get_nowait()
+                            self.synchronized_queue.put_nowait(frame_pair)
+                            self.stats['dropped_frames'] += 1
+                        except:
+                            pass
+                else:
+                    if startLoop % 30 == 0:
+                        print("Waiting to stabilize the cameras")
+
                 # Calculate and record loop timing statistics
                 loop_end_time = time.time()
                 loop_duration = loop_end_time - loop_start_time
@@ -702,13 +910,18 @@ class HardwareSyncDualCamera:
         if self.capture_thread and self.capture_thread.is_alive():
             self.capture_thread.join(timeout=5)
         
-        # Cleanup temporary files
+        # Cleanup temporary files (whether RAM or disk-based)
         try:
             os.unlink(self.server_fifo)
             os.unlink(self.client_fifo)
             os.rmdir(self.temp_dir)
-        except:
+            self.logger.info(f"🧹 Cleaned up temporary directory: {self.temp_dir}")
+        except Exception as e:
+            self.logger.warning(f"⚠️  Failed to cleanup temporary files: {e}")
             pass
+        
+        # Cleanup dedicated RAM disk if we created one
+        self._cleanup_dedicated_ram_disk()
         
         self.logger.info("Capture stopped")
     
@@ -1047,9 +1260,9 @@ if __name__ == "__main__":
         capture = HardwareSyncDualCamera(
             width=1920,
             height=1080,
-            framerate=15,
-            bitrate=4000000,
-            flip_camera0=False,
+            framerate=30,
+            bitrate=8000000,
+            flip_camera0=True,
             enable_homography=False,
             homography_file="wallCalibration_image_1080.pickle",
             correct_camera1_to_camera0=False,
